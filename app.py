@@ -320,6 +320,9 @@ XLSX_COLUMNS = [
 ]
 
 
+PARAMS_SHEET = "_параметры"
+
+
 def build_xlsx(p, rows, best) -> bytes:
     """Файл Excel: исходные данные, сравнение вариантов, расчёт по шагам."""
     import io
@@ -446,9 +449,28 @@ def build_xlsx(p, rows, best) -> bytes:
                 ws.cell(ws.max_row, 2).font = bold
         ws.append([])
 
+    # Скрытый лист: из него калькулятор восстанавливает расчёт («Открыть сохранённый расчёт»)
+    ws = wb.create_sheet(PARAMS_SHEET)
+    for k, v in p["saved"].items():
+        ws.append([k, encode(v)])
+    ws.sheet_state = "hidden"
+
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+def load_xlsx(file) -> dict:
+    """Значения полей из файла, скачанного калькулятором; пустой словарь, если листа нет."""
+    from openpyxl import load_workbook
+
+    try:
+        wb = load_workbook(file, read_only=True)
+    except Exception:
+        return {}
+    if PARAMS_SHEET not in wb.sheetnames:
+        return {}
+    return {k: decode(k, v) for k, v in wb[PARAMS_SHEET].iter_rows(values_only=True) if k in DEFAULTS}
 
 
 # ---------------------------------------------------------------------------
@@ -467,55 +489,114 @@ def parse_money(text: str):
     return round(value) if value >= 0 else None
 
 
-def money_input(label: str, default: int, key: str, help: str | None = None) -> int:
-    """Поле для суммы: цифры разделяются пробелами по три."""
-    if key not in st.session_state:
-        st.session_state[key] = rub(default)[:-2]
+# Значения полей по умолчанию. Всё, что введено, хранится в адресе страницы (?income=...),
+# поэтому обновление браузера цифры не сбрасывает; ещё их можно восстановить из скачанного Excel.
+DEFAULTS = {
+    "income": "12 000 000", "expenses": "5 000 000", "vat_share": 50, "staff": 2, "payroll": "1 200 000",
+    "clients_vat": False, "vat_discount": 15, "rate_kind": "Обычная: 6% и 15%",
+    "lg_d": None, "lg_dr": None, "lg_ooo": True, "msp": False,
+}
+RATE_KINDS = ["Обычная: 6% и 15%", "Льготная ставка региона"]
 
+
+def encode(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    return str(value)
+
+
+def decode(key: str, raw):
+    """Строка из адреса или Excel → значение поля; при ошибке — значение по умолчанию."""
+    default = DEFAULTS[key]
+    raw = "" if raw is None else str(raw).strip()
+    try:
+        if key in ("lg_d", "lg_dr"):
+            return None if raw == "" else float(raw.replace(",", "."))
+        if isinstance(default, bool):
+            return raw in ("1", "True", "true", "да")
+        if isinstance(default, int):
+            return int(float(raw.replace(",", ".")))
+        if key == "rate_kind":
+            return raw if raw in RATE_KINDS else default
+        value = parse_money(raw)
+        return default if value is None else rub(value)[:-2]
+    except ValueError:
+        return default
+
+
+ss = st.session_state
+if "_saved" not in ss:
+    ss["_saved"] = {k: decode(k, st.query_params[k]) if k in st.query_params else d for k, d in DEFAULTS.items()}
+for k in DEFAULTS:
+    # поле, которое было скрыто (например, льготная ставка), получает прежнее значение обратно
+    if k not in ss:
+        ss[k] = ss["_saved"][k]
+
+
+def money_input(label: str, key: str, help: str | None = None) -> int:
+    """Поле для суммы: цифры разделяются пробелами по три."""
     def reformat():
-        value = parse_money(st.session_state[key])
+        value = parse_money(ss[key])
         if value is not None:
-            st.session_state[key] = rub(value)[:-2]
+            ss[key] = rub(value)[:-2]
 
     st.text_input(label, key=key, help=help, on_change=reformat)
-    value = parse_money(st.session_state[key])
+    value = parse_money(ss[key])
     if value is None:
         st.error("Введите сумму цифрами, например 22 300 000")
         return 0
     return value
+
+
 st.title("🧮 Какую систему налогообложения выбрать")
 st.caption("ИП и ООО: УСН, ОСНО, АУСН. Правила 2026 года. Расчёт ориентировочный — "
            "итоговое решение принимает бухгалтер с учётом всех обстоятельств.")
 
 with st.sidebar:
     st.header("Исходные данные")
-    income = money_input("Выручка за год (с НДС), ₽", 12_000_000, "income",
+    with st.expander("📂 Открыть сохранённый расчёт"):
+        st.caption("Выберите файл Excel, который раньше скачали из калькулятора, — все цифры подставятся сами.")
+        uploaded = st.file_uploader("Файл расчёта", type=["xlsx"], label_visibility="collapsed")
+        if uploaded is not None and ss.get("_loaded_file") != uploaded.file_id:
+            loaded = load_xlsx(uploaded)
+            if loaded:
+                for k, v in loaded.items():
+                    ss[k] = ss["_saved"][k] = v
+                st.success("Расчёт загружен.")
+            else:
+                st.error("В этом файле нет сохранённых данных калькулятора. "
+                         "Подходит только файл, скачанный кнопкой «Скачать расчёт в Excel».")
+            ss["_loaded_file"] = uploaded.file_id
+
+    income = money_input("Выручка за год (с НДС), ₽", "income",
                          help="Всё, что платят клиенты за год, включая НДС, если он есть.")
-    expenses = money_input("Расходы за год, ₽", 5_000_000, "expenses",
+    expenses = money_input("Расходы за год, ₽", "expenses",
                            help="Без зарплаты и взносов — их укажите ниже.")
-    vat_share = st.slider("Доля расходов с входящим НДС 22%, %", 0, 100, 50,
+    vat_share = st.slider("Доля расходов с входящим НДС 22%, %", 0, 100, key="vat_share",
                           help="Какая часть расходов — от поставщиков с НДС. Влияет на вычеты на ОСНО и УСН с НДС 22%.")
-    staff = st.number_input("Количество сотрудников", min_value=0, value=2, step=1)
-    payroll = money_input("Фонд оплаты труда за год, ₽", 1_200_000, "payroll",
+    staff = st.number_input("Количество сотрудников", min_value=0, step=1, key="staff")
+    payroll = money_input("Фонд оплаты труда за год, ₽", "payroll",
                           help="Начисленная зарплата до вычета НДФЛ, без взносов.")
-    clients_vat = st.checkbox("Клиентам важен входящий НДС", value=False,
+    clients_vat = st.checkbox("Клиентам важен входящий НДС", key="clients_vat",
                               help="Клиенты — компании на ОСНО, которым нужен вычет НДС.")
     vat_discount = 0
     if clients_vat:
-        vat_discount = st.slider("Скидка, которую потребуют клиенты без НДС, %", 0, 25, 15,
+        vat_discount = st.slider("Скидка, которую потребуют клиенты без НДС, %", 0, 25, key="vat_discount",
                                  help="Насколько придётся снизить цену, если вы не выставляете НДС 22%.")
 
     st.subheader("Ставка УСН")
-    rate_kind = st.radio("Ставка УСН", ["Обычная: 6% и 15%", "Льготная ставка региона"],
-                         label_visibility="collapsed",
+    rate_kind = st.radio("Ставка УСН", RATE_KINDS, key="rate_kind", label_visibility="collapsed",
                          help="Регион своим законом может снизить ставку УСН. Например, в Санкт-Петербурге.")
     usn_rates = {"ИП": (6.0, "", 15.0, ""), "ООО": (6.0, "", 15.0, "")}
     if rate_kind == "Льготная ставка региона":
         lg_d = st.number_input("Льготная ставка УСН «Доходы», %", min_value=0.0, max_value=6.0,
-                               value=None, step=0.5, placeholder="введите ставку региона")
+                               value=None, step=0.5, placeholder="введите ставку региона", key="lg_d")
         lg_dr = st.number_input("Льготная ставка УСН «Доходы минус расходы», %", min_value=0.0,
-                                max_value=15.0, value=None, step=0.5, placeholder="введите ставку региона")
-        lg_ooo = st.checkbox("Льгота действует и для ООО", value=True,
+                                max_value=15.0, value=None, step=0.5, placeholder="введите ставку региона",
+                                key="lg_dr")
+        lg_ooo = st.checkbox("Льгота действует и для ООО", key="lg_ooo",
                              help="Снимите галочку, если по закону региона льгота только для ИП.")
         if lg_d is None and lg_dr is None:
             st.caption("Введите ставку хотя бы по одному объекту. Пока поле пустое, считается обычная ставка.")
@@ -526,12 +607,22 @@ with st.sidebar:
             usn_rates["ООО"] = lg
 
     with st.expander("Тарифы взносов"):
-        msp = st.checkbox("Льготный тариф взносов МСП (15% свыше 1,5 МРОТ)", value=False,
+        msp = st.checkbox("Льготный тариф взносов МСП (15% свыше 1,5 МРОТ)", key="msp",
                           help="С 2026 года льгота сохранена не для всех отраслей — уточните по своему ОКВЭД.")
+
+    st.caption("💾 Введённые цифры сохраняются в адресе страницы: если обновить браузер, они не пропадут. "
+               "Чтобы вернуться к расчёту позже, добавьте страницу в закладки или скачайте расчёт в Excel.")
+
+# запоминаем введённое: в памяти сессии и в адресе страницы
+for k in DEFAULTS:
+    if k in ss:
+        ss["_saved"][k] = ss[k]
+st.query_params.from_dict({k: encode(v) for k, v in ss["_saved"].items() if v != DEFAULTS[k]})
 
 input_vat = expenses * vat_share / 100 * VAT / (1 + VAT)
 p = dict(income=income, expenses=expenses, payroll=payroll, staff=int(staff), clients_vat=clients_vat,
-         vat_discount=vat_discount, usn_rates=usn_rates, msp=msp, input_vat=input_vat)
+         vat_discount=vat_discount, usn_rates=usn_rates, msp=msp, input_vat=input_vat,
+         saved=dict(ss["_saved"]))
 
 if income <= 0:
     st.info("Введите выручку за год в панели слева.")

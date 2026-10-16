@@ -297,9 +297,9 @@ CHART_NAMES = {
 }
 CHART_COLORS = {
     "Налог": "#FF8A00",
-    "НДС": "#4A78C2",
+    "НДС": "#0A6CFF",
     "Взносы ИП за себя": "#9B6BC4",
-    "Взносы за сотрудников": "#2E9E8F",
+    "Взносы за сотрудников": "#12A33A",
     "НДФЛ с дивидендов": "#D9534F",
     "Потери без НДС": "#9E9E9E",
 }
@@ -331,7 +331,7 @@ def build_xlsx(p, rows, best) -> bytes:
     money, pct = '#,##0 "₽"', '0.0%'
     bold = Font(bold=True)
     head_fill = PatternFill("solid", fgColor="FFF5EC")
-    best_fill = PatternFill("solid", fgColor="C8F0D0")
+    best_fill = PatternFill("solid", fgColor="C9F29B")
     grey = Font(color="999999")
     thin = Side(style="thin", color="D0D0D0")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
@@ -455,21 +455,49 @@ def build_xlsx(p, rows, best) -> bytes:
 # Интерфейс
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="Калькулятор налогов", page_icon="🧮", layout="wide")
+
+
+def parse_money(text: str):
+    """«22 300 000», «22300000,50», «22 300 000 ₽» → число; None, если это не число."""
+    clean = str(text).replace("\u00a0", "").replace(" ", "").replace("₽", "").replace(",", ".")
+    try:
+        value = float(clean)
+    except ValueError:
+        return None
+    return round(value) if value >= 0 else None
+
+
+def money_input(label: str, default: int, key: str, help: str | None = None) -> int:
+    """Поле для суммы: цифры разделяются пробелами по три."""
+    if key not in st.session_state:
+        st.session_state[key] = rub(default)[:-2]
+
+    def reformat():
+        value = parse_money(st.session_state[key])
+        if value is not None:
+            st.session_state[key] = rub(value)[:-2]
+
+    st.text_input(label, key=key, help=help, on_change=reformat)
+    value = parse_money(st.session_state[key])
+    if value is None:
+        st.error("Введите сумму цифрами, например 22 300 000")
+        return 0
+    return value
 st.title("🧮 Какую систему налогообложения выбрать")
 st.caption("ИП и ООО: УСН, ОСНО, АУСН. Правила 2026 года. Расчёт ориентировочный — "
            "итоговое решение принимает бухгалтер с учётом всех обстоятельств.")
 
 with st.sidebar:
     st.header("Исходные данные")
-    income = st.number_input("Выручка за год (с НДС), ₽", min_value=0, value=12_000_000, step=500_000,
-                             help="Всё, что платят клиенты за год, включая НДС, если он есть.")
-    expenses = st.number_input("Расходы за год, ₽", min_value=0, value=5_000_000, step=500_000,
-                               help="Без зарплаты и взносов — их укажите ниже.")
+    income = money_input("Выручка за год (с НДС), ₽", 12_000_000, "income",
+                         help="Всё, что платят клиенты за год, включая НДС, если он есть.")
+    expenses = money_input("Расходы за год, ₽", 5_000_000, "expenses",
+                           help="Без зарплаты и взносов — их укажите ниже.")
     vat_share = st.slider("Доля расходов с входящим НДС 22%, %", 0, 100, 50,
                           help="Какая часть расходов — от поставщиков с НДС. Влияет на вычеты на ОСНО и УСН с НДС 22%.")
     staff = st.number_input("Количество сотрудников", min_value=0, value=2, step=1)
-    payroll = st.number_input("Фонд оплаты труда за год, ₽", min_value=0, value=1_200_000, step=100_000,
-                              help="Начисленная зарплата до вычета НДФЛ, без взносов.")
+    payroll = money_input("Фонд оплаты труда за год, ₽", 1_200_000, "payroll",
+                          help="Начисленная зарплата до вычета НДФЛ, без взносов.")
     clients_vat = st.checkbox("Клиентам важен входящий НДС", value=False,
                               help="Клиенты — компании на ОСНО, которым нужен вычет НДС.")
     vat_discount = 0
@@ -592,7 +620,7 @@ with tab_cmp:
 
     def highlight(row):
         if row["Вариант"] == best_name:
-            return ["background-color: #c8f0d0; color: #0b3d1a; font-weight: 600"] * len(row)
+            return ["background-color: #C9F29B; color: #0B4D12; font-weight: 600"] * len(row)
         if row["Доступен ли"].startswith("⛔"):
             return ["color: #999999"] * len(row)
         return [""] * len(row)

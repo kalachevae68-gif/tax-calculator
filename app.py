@@ -131,7 +131,7 @@ def vat22_steps(steps, p):
     out_vat = income * VAT / (1 + VAT)
     steps.append(("НДС начисленный 22%", f"{rub(income)} × 22 ÷ 122 (НДС, который сидит в выручке)", out_vat))
     steps.append(("НДС входящий (вычет)",
-                  f"{rub(expenses)} × {p['vat_share']}% (поле «Доля расходов с входящим НДС») × 22 ÷ 122",
+                  "поле «в т.ч. входящий НДС к вычету» — НДС из счетов поставщиков, он уже входит в расходы",
                   p["input_vat"]))
     vat = out_vat - p["input_vat"]
     steps.append(("НДС к уплате", f"{rub(out_vat)} − {rub(p['input_vat'])}", vat))
@@ -510,7 +510,7 @@ def build_xlsx(p, rows, best) -> bytes:
     data = [
         ("Выручка за год (с НДС)", p["income"], money),
         ("Расходы за год", p["expenses"], money),
-        ("в т.ч. входящий НДС в расходах", p["input_vat"], money),
+        ("Входящий НДС к вычету (уже входит в расходы)", p["input_vat"], money),
         ("Количество сотрудников", p["staff"], "0"),
         ("Фонд оплаты труда за год", p["payroll"], money),
         ("Прибыль до налогов (выручка − расходы − зарплата)", p["income"] - p["expenses"] - p["payroll"], money),
@@ -653,7 +653,7 @@ def parse_money(text: str):
 # Значения полей по умолчанию. Всё, что введено, хранится в адресе страницы (?income=...),
 # поэтому обновление браузера цифры не сбрасывает; ещё их можно восстановить из скачанного Excel.
 DEFAULTS = {
-    "income": "12 000 000", "expenses": "5 000 000", "vat_share": 50, "staff": 2, "payroll": "1 200 000",
+    "income": "12 000 000", "expenses": "5 000 000", "input_vat": "0", "staff": 2, "payroll": "1 200 000",
     "clients_vat": False, "vat_discount": 15, "rate_kind": "Обычная: 6% и 15%",
     "lg_d": None, "lg_dr": None, "lg_ooo": True, "msp": False,
 }
@@ -735,8 +735,17 @@ with st.sidebar:
                          help="Всё, что платят клиенты за год, включая НДС, если он есть.")
     expenses = money_input("Расходы за год, ₽", "expenses",
                            help="Без зарплаты и взносов — их укажите ниже.")
-    vat_share = st.slider("Доля расходов с входящим НДС 22%, %", 0, 100, key="vat_share",
-                          help="Какая часть расходов — от поставщиков с НДС. Влияет на вычеты на ОСНО и УСН с НДС 22%.")
+    input_vat = money_input("в т.ч. входящий НДС к вычету, ₽", "input_vat",
+                            help="НДС из счетов поставщиков, которые работают с НДС 22%. Эта сумма уже входит "
+                                 "в «Расходы за год». Её принимают к вычету на ОСНО и на УСН со ставкой НДС 22%. "
+                                 "На УСН с НДС 5% или 7% вычета нет. Если поставщики без НДС — оставьте 0.")
+    max_input_vat = expenses * VAT / (1 + VAT)
+    if input_vat > max_input_vat:
+        st.warning(f"Входящий НДС не может быть больше {rub(max_input_vat)}: столько НДС было бы, "
+                   "если бы все расходы были от поставщиков с НДС 22%.")
+    elif expenses and input_vat:
+        st.caption(f"Это {input_vat / max_input_vat * 100:.0f}% от максимально возможного НДС в ваших расходах "
+                   f"({rub(max_input_vat)}).")
     staff = st.number_input("Количество сотрудников", min_value=0, step=1, key="staff")
     payroll = money_input("Фонд оплаты труда за год, ₽", "payroll",
                           help="Начисленная зарплата до вычета НДФЛ, без взносов.")
@@ -780,9 +789,9 @@ for k in DEFAULTS:
         ss["_saved"][k] = ss[k]
 st.query_params.from_dict({k: encode(v) for k, v in ss["_saved"].items() if v != DEFAULTS[k]})
 
-input_vat = expenses * vat_share / 100 * VAT / (1 + VAT)
+input_vat = min(input_vat, expenses * VAT / (1 + VAT))
 p = dict(income=income, expenses=expenses, payroll=payroll, staff=int(staff), clients_vat=clients_vat,
-         vat_discount=vat_discount, usn_rates=usn_rates, msp=msp, input_vat=input_vat, vat_share=vat_share,
+         vat_discount=vat_discount, usn_rates=usn_rates, msp=msp, input_vat=input_vat,
          saved=dict(ss["_saved"]))
 
 if income <= 0:

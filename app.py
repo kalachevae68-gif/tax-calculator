@@ -489,7 +489,8 @@ def build_xlsx(p, rows, best) -> bytes:
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
 
-    money, pct = '#,##0 "₽"', '0.0%'
+    # обычный числовой формат без «₽»: ячейки можно складывать формулами, суммы — с копейками
+    money, pct = '#,##0.00', '0.0%'
     bold = Font(bold=True)
     head_fill = PatternFill("solid", fgColor="FFF5EC")
     best_fill = PatternFill("solid", fgColor="C9F29B")
@@ -522,15 +523,15 @@ def build_xlsx(p, rows, best) -> bytes:
     if p["clients_vat"]:
         data.append(("Скидка клиентам без НДС, %", p["vat_discount"], "0"))
     for name, value, fmt in data:
-        ws.append([name, value])
+        ws.append([name + (", ₽" if fmt == money else ""), round(value, 2) if isinstance(value, float) else value])
         if fmt:
             ws.cell(ws.max_row, 2).number_format = fmt
     if best:
         ws.append([])
         ws.append(["Самый выгодный вариант", best["Название"]])
-        ws.append(["Налоговая нагрузка", best["Итого"]])
+        ws.append(["Налоговая нагрузка, ₽", round(best["Итого"], 2)])
         ws.cell(ws.max_row, 2).number_format = money
-        ws.append(["Чистая прибыль после налогов", best["Собственнику"]])
+        ws.append(["Чистая прибыль после налогов, ₽", round(best["Собственнику"], 2)])
         ws.cell(ws.max_row, 2).number_format = money
         for r in range(ws.max_row - 2, ws.max_row + 1):
             ws.cell(r, 1).font = bold
@@ -559,7 +560,7 @@ def build_xlsx(p, rows, best) -> bytes:
             elif k == "Собственнику" and r["Форма"] != "ООО":
                 line.append("—")
             else:
-                line.append(r[k])
+                line.append(round(r[k], 2) if isinstance(r[k], float) else r[k])
         ws.append(line)
         row = ws.max_row
         for c, (k, _) in enumerate(cols, start=1):
@@ -592,15 +593,19 @@ def build_xlsx(p, rows, best) -> bytes:
         ws.cell(ws.max_row, 1).font = Font(bold=True, size=12)
         if best and r["Название"] == best["Название"]:
             ws.cell(ws.max_row, 1).fill = best_fill
-        ws.append(["Что считаем", "Откуда берём и как считаем", "Сумма"])
+        ws.append(["Что считаем", "Откуда берём и как считаем", "Сумма, ₽"])
         for c in range(1, 4):
             ws.cell(ws.max_row, c).font, ws.cell(ws.max_row, c).fill = bold, head_fill
         for name, how, value in r["Шаги"]:
-            ws.append([name, how, round(value, 2) if isinstance(value, float) else value])
+            if isinstance(value, str) and value.endswith("%"):
+                ws.append([name, how, round(r["% от дохода"] / 100, 4)])
+                ws.cell(ws.max_row, 3).number_format = pct
+            else:
+                ws.append([name, how, round(value, 2) if isinstance(value, float) else value])
+                if isinstance(value, (int, float)):
+                    ws.cell(ws.max_row, 3).number_format = money
             row = ws.max_row
             ws.cell(row, 2).alignment = wrap
-            if isinstance(value, (int, float)):
-                ws.cell(row, 3).number_format = '#,##0.00 "₽"'
             for c in range(1, 4):
                 ws.cell(row, c).border = border
                 if is_part_step(name):

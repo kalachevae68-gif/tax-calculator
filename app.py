@@ -716,8 +716,24 @@ with tab_cmp:
             return ["color: #999999"] * len(row)
         return [""] * len(row)
 
-    st.dataframe(table.style.apply(highlight, axis=1), hide_index=True, width="stretch",
-                 height=38 * (len(table) + 1))
+    # Обычная HTML-таблица: заголовки и названия вариантов переносятся по словам, ничего не обрезается
+    styled = (table.style.apply(highlight, axis=1).hide(axis="index")
+              .set_table_attributes('class="cmp-table"'))
+    st.markdown("""
+<style>
+.cmp-wrap {overflow-x: auto;}
+.cmp-table {border-collapse: collapse; width: 100%; font-size: 14px;}
+.cmp-table th, .cmp-table td {border: 1px solid #DCE8CF; padding: 6px 8px; vertical-align: top;}
+.cmp-table th {background: #E6F8CF; font-weight: 600; text-align: left; white-space: normal;
+               word-break: normal; overflow-wrap: break-word; min-width: 90px;}
+.cmp-table td {text-align: right; white-space: nowrap;}
+.cmp-table td:first-child {text-align: left; white-space: normal; min-width: 220px;}
+.cmp-table td:last-child {text-align: left; white-space: normal;}
+</style>
+""", unsafe_allow_html=True)
+    # без отступов и пустых строк, иначе Markdown примет часть таблицы за блок кода
+    html = "".join(line.strip() for line in styled.to_html().splitlines())
+    st.markdown(f'<div class="cmp-wrap">{html}</div>', unsafe_allow_html=True)
 
     try:
         xlsx = build_xlsx(p, rows, best)

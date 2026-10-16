@@ -58,24 +58,119 @@ def ip_own_contrib(base_1pct: float) -> float:
     return IP_FIXED + extra
 
 
-def staff_contrib(payroll: float, staff: int, msp: bool) -> float:
-    """Взносы с ФОТ: считаем по средней зарплате на сотрудника."""
+def pct(rate: float) -> str:
+    """0.075 → «7,5%»."""
+    return f"{rate * 100:g}%".replace(".", ",")
+
+
+def staff_contrib(payroll: float, staff: int, msp: bool):
+    """Взносы с ФОТ по средней зарплате на сотрудника: (сумма, как посчитано)."""
     if payroll <= 0 or staff <= 0:
-        return 0.0
+        return 0.0, ""
     per = payroll / staff
+    each = f" на каждого из {staff} сотрудников" if staff > 1 else ""
     if msp:
         threshold = 1.5 * MROT * 12
         main = min(per, threshold) * 0.30 + max(per - threshold, 0) * 0.15
+        how = (f"зарплата {rub(per)}{each}: до {rub(threshold)} (1,5 МРОТ × 12) × 30%"
+               + (f", сверх — {rub(per - threshold)} × 15%" if per > threshold else ""))
     else:
         main = min(per, INS_BASE) * 0.30 + max(per - INS_BASE, 0) * 0.151
-    return (main + per * INJURY) * staff
+        how = (f"зарплата {rub(per)}{each} × 30%"
+               + (f" (до {rub(INS_BASE)}), сверх — {rub(per - INS_BASE)} × 15,1%" if per > INS_BASE else ""))
+    how += f" + {rub(per)} × 0,2% «на травматизм»"
+    if staff > 1:
+        how += f"; × {staff} чел."
+    return (main + per * INJURY) * staff, how
+
+
+def progressive_how(amount: float, scale) -> str:
+    """Как считается налог по шкале: «2 400 000 ₽ × 13% + (X − 2 400 000 ₽) × 15%»."""
+    parts, lower = [], 0.0
+    for upper, rate in scale:
+        if amount <= lower:
+            break
+        if lower == 0:
+            parts.append(f"{rub(min(amount, upper))} × {pct(rate)}")
+        else:
+            parts.append(f"({rub(min(amount, upper))} − {rub(lower)}) × {pct(rate)}")
+        lower = upper
+    return " + ".join(parts) if parts else "прибыли нет — налога нет"
+
+
+def own_contrib_steps(steps, base_1pct: float, base_how: str) -> float:
+    """Взносы ИП за себя с расшифровкой. Возвращает сумму."""
+    extra = min(max(base_1pct - IP_1PCT_THRESHOLD, 0) * 0.01, IP_1PCT_CAP)
+    steps.append(("Взносы ИП за себя: фиксированные", "сумма на 2026 год, одинакова для всех ИП", IP_FIXED))
+    steps.append(("Взносы ИП за себя: 1%",
+                  f"({base_how} − {rub(IP_1PCT_THRESHOLD)}) × 1%, но не больше {rub(IP_1PCT_CAP)}", extra))
+    steps.append(("Взносы ИП за себя, всего", f"{rub(IP_FIXED)} + {rub(extra)}", IP_FIXED + extra))
+    return IP_FIXED + extra
+
+
+def dividend_steps(steps, profit: float, profit_how: str) -> float:
+    """Чистая прибыль ООО к выплате и НДФЛ с дивидендов. Возвращает НДФЛ."""
+    profit = max(profit, 0)
+    steps.append(("Чистая прибыль к выплате дивидендами", profit_how, profit))
+    ndfl = progressive(profit, DIV_SCALE)
+    steps.append(("НДФЛ с дивидендов", progressive_how(profit, DIV_SCALE), ndfl))
+    return ndfl
+
+
+def input_steps(steps, p):
+    steps.append(("Выручка с НДС", "поле «Выручка за год (с НДС)»", p["income"]))
+    steps.append(("Расходы", "поле «Расходы за год»", p["expenses"]))
+    if p["payroll"]:
+        steps.append(("Зарплата сотрудников", "поле «Фонд оплаты труда за год»", p["payroll"]))
+
+
+def vat22_steps(steps, p):
+    """НДС 22% с вычетом: (НДС к уплате, выручка без НДС, расходы без НДС)."""
+    income, expenses = p["income"], p["expenses"]
+    out_vat = income * VAT / (1 + VAT)
+    steps.append(("НДС начисленный 22%", f"{rub(income)} × 22 ÷ 122 (НДС, который сидит в выручке)", out_vat))
+    steps.append(("НДС входящий (вычет)",
+                  f"{rub(expenses)} × {p['vat_share']}% (поле «Доля расходов с входящим НДС») × 22 ÷ 122",
+                  p["input_vat"]))
+    vat = out_vat - p["input_vat"]
+    steps.append(("НДС к уплате", f"{rub(out_vat)} − {rub(p['input_vat'])}", vat))
+    inc, exp = income - out_vat, expenses - p["input_vat"]
+    steps.append(("Выручка без НДС", f"{rub(income)} − {rub(out_vat)}", inc))
+    steps.append(("Расходы без НДС", f"{rub(expenses)} − {rub(p['input_vat'])}", exp))
+    return vat, inc, exp
+
+
+def staff_steps(steps, p) -> float:
+    sc, how = staff_contrib(p["payroll"], p["staff"], p["msp"])
+    if sc:
+        steps.append(("Взносы за сотрудников", how, sc))
+    return sc
 
 
 # ---------------------------------------------------------------------------
-# Расчёт режимов
+# Расчёт режимов. Шаг расчёта — (что считаем, откуда берём и как считаем, сумма)
 # ---------------------------------------------------------------------------
 def result(form, regime, comps, steps, problems, p):
     total = sum(comps.values())
+    pbt = p["income"] - p["expenses"] - p["payroll"]
+    names = {"Налог": "налог", "НДС": "НДС", "Взносы ИП за себя": "взносы ИП",
+             "Взносы за сотрудников": "взносы за сотрудников", "НДФЛ с дивидендов": "НДФЛ с дивидендов",
+             "Потери без НДС": "скидка клиентам"}
+    used = [f"{names[k]} {rub(v)}" for k, v in comps.items() if v]
+    steps = steps + [
+        ("Налоговая нагрузка", " + ".join(used) if used else "налогов нет", total),
+        ("Налоговая нагрузка, % от выручки", f"{rub(total)} ÷ {rub(p['income'])} × 100",
+         f"{total / p['income'] * 100:.1f}%".replace(".", ",") if p["income"] else "—"),
+        ("Прибыль до налогов", f"выручка {rub(p['income'])} − расходы {rub(p['expenses'])}"
+                               + (f" − зарплата {rub(p['payroll'])}" if p["payroll"] else ""), pbt),
+        ("Чистая прибыль после налогов",
+         f"{rub(pbt)} − налоговая нагрузка без НДФЛ с дивидендов {rub(total - comps['НДФЛ с дивидендов'])}",
+         pbt - total + comps["НДФЛ с дивидендов"]),
+    ]
+    if form == "ООО":
+        steps.append(("Чистая прибыль собственнику ООО",
+                      f"{rub(pbt - total + comps['НДФЛ с дивидендов'])} − НДФЛ с дивидендов "
+                      f"{rub(comps['НДФЛ с дивидендов'])}", pbt - total))
     return {
         "Форма": form,
         "Режим": regime,
@@ -83,9 +178,9 @@ def result(form, regime, comps, steps, problems, p):
         **comps,
         "Итого": total,
         "% от дохода": total / p["income"] * 100 if p["income"] else 0.0,
-        "Прибыль до налогов": p["income"] - p["expenses"] - p["payroll"],
-        "Чистая прибыль": p["income"] - p["expenses"] - p["payroll"] - total + comps["НДФЛ с дивидендов"],
-        "Собственнику": p["income"] - p["expenses"] - p["payroll"] - total,
+        "Прибыль до налогов": pbt,
+        "Чистая прибыль": pbt - total + comps["НДФЛ с дивидендов"],
+        "Собственнику": pbt - total,
         "Доступен": not problems,
         "Причины": problems,
         "Шаги": steps,
@@ -99,29 +194,39 @@ def vat_loss(p, vat_rate: float) -> float:
     return p["income"] * p["vat_discount"] / 100 * (1 - vat_rate / VAT)
 
 
+def vat_loss_step(steps, p, vat_rate, comps):
+    comps["Потери без НДС"] = vat_loss(p, vat_rate)
+    if comps["Потери без НДС"]:
+        steps.append(("Скидка клиентам за работу без полного НДС",
+                      f"{rub(p['income'])} × {p['vat_discount']}% (поле «Скидка…») × (1 − {pct(vat_rate)} ÷ 22%)",
+                      comps["Потери без НДС"]))
+
+
 def calc_usn(p, form, obj, vat_mode):
     """obj: 'Д' или 'ДР'; vat_mode: None (освобождение), 'reduced' (5/7%), 'full' (22%)."""
-    income, expenses, payroll, staff = p["income"], p["expenses"], p["payroll"], p["staff"]
+    income, payroll, staff = p["income"], p["payroll"], p["staff"]
     comps = dict.fromkeys(COMPONENTS, 0.0)
     steps, problems = [], []
+    input_steps(steps, p)
 
     if vat_mode is None:
-        inc, exp, vat_rate = income, expenses, 0.0
+        inc, exp, vat_rate = income, p["expenses"], 0.0
+        steps.append(("НДС", f"не платится: выручка не больше {rub(USN_VAT_FREE)} — освобождение", 0.0))
         if income > USN_VAT_FREE:
             problems.append(f"доход выше {rub(USN_VAT_FREE)} — освобождение от НДС не действует")
         title_vat = ""
     elif vat_mode == "reduced":
         vat_rate = 0.05 if income <= USN_VAT5_LIMIT else 0.07
+        k = round(vat_rate * 100)
         comps["НДС"] = income * vat_rate / (1 + vat_rate)
-        inc, exp = income - comps["НДС"], expenses
-        steps.append(f"НДС {vat_rate:.0%} без вычетов: {rub(income)} × {vat_rate:.0%}/{1 + vat_rate:.2f} = {rub(comps['НДС'])}")
-        title_vat = f" + НДС {vat_rate:.0%}"
+        steps.append((f"НДС {k}% к уплате", f"{rub(income)} × {k} ÷ {100 + k} (вычетов на этой ставке нет)",
+                      comps["НДС"]))
+        inc, exp = income - comps["НДС"], p["expenses"]
+        steps.append(("Выручка без НДС", f"{rub(income)} − {rub(comps['НДС'])}", inc))
+        title_vat = f" + НДС {k}%"
     else:
         vat_rate = VAT
-        out_vat = income * VAT / (1 + VAT)
-        comps["НДС"] = out_vat - p["input_vat"]
-        inc, exp = income - out_vat, expenses - p["input_vat"]
-        steps.append(f"НДС 22%: начислено {rub(out_vat)} − вычет {rub(p['input_vat'])} = {rub(comps['НДС'])}")
+        comps["НДС"], inc, exp = vat22_steps(steps, p)
         title_vat = " + НДС 22%"
 
     if income > USN_LIMIT:
@@ -129,85 +234,94 @@ def calc_usn(p, form, obj, vat_mode):
     if staff > USN_STAFF:
         problems.append(f"сотрудников больше {USN_STAFF}")
 
-    sc = staff_contrib(payroll, staff, p["msp"])
+    sc = staff_steps(steps, p)
     comps["Взносы за сотрудников"] = sc
-    if sc:
-        steps.append(f"Взносы с ФОТ {rub(payroll)}: {rub(sc)}")
 
     rate_d, mark_d, rate_dr, mark_dr = p["usn_rates"][form]
 
     if obj == "Д":
         rate = rate_d / 100
+        src = "льготная ставка региона" if mark_d else "обычная ставка"
         base_tax = inc * rate
-        steps.append(f"Налог до уменьшения: {rub(inc)} × {rate * 100:g}% = {rub(base_tax)}")
+        steps.append(("Налог УСН до уменьшения", f"выручка без НДС {rub(inc)} × {pct(rate)} ({src})", base_tax))
         if form == "ИП":
-            own = ip_own_contrib(inc)
+            own = own_contrib_steps(steps, inc, rub(inc))
             comps["Взносы ИП за себя"] = own
-            steps.append(f"Взносы ИП за себя: {rub(own)}")
             if staff > 0:
                 reduce = min(own + sc, base_tax * 0.5)
-                steps.append(f"Есть сотрудники — налог уменьшается на взносы не более чем на 50%: −{rub(reduce)}")
+                how = (f"взносы {rub(own)} + {rub(sc)} = {rub(own + sc)}; есть сотрудники, поэтому не больше "
+                       f"50% налога: {rub(base_tax)} × 50% = {rub(base_tax * 0.5)}; берём меньшее")
             else:
                 reduce = min(own, base_tax)
-                steps.append(f"Без сотрудников налог уменьшается на взносы полностью: −{rub(reduce)}")
+                how = f"взносы ИП {rub(own)}; сотрудников нет — можно уменьшить до нуля, но не больше налога {rub(base_tax)}"
         else:
             reduce = min(sc, base_tax * 0.5)
-            if reduce:
-                steps.append(f"Уменьшение на взносы за сотрудников (не более 50%): −{rub(reduce)}")
+            how = (f"взносы за сотрудников {rub(sc)}, но не больше 50% налога: "
+                   f"{rub(base_tax)} × 50% = {rub(base_tax * 0.5)}; берём меньшее")
+        if reduce:
+            steps.append(("Уменьшение налога на взносы", how, -reduce))
         comps["Налог"] = base_tax - reduce
+        steps.append(("Налог УСН к уплате", f"{rub(base_tax)} − {rub(reduce)}", comps["Налог"]))
         regime = f"УСН «Доходы» {rate_d:g}%{mark_d}{title_vat}"
     else:
         rate = rate_dr / 100
+        src = "льготная ставка региона" if mark_dr else "обычная ставка"
         own = 0.0
         if form == "ИП":
-            own = ip_own_contrib(inc - exp - payroll - sc)
+            diff = inc - exp - payroll - sc
+            steps.append(("Разница для взноса 1%",
+                          f"{rub(inc)} − {rub(exp)}" + (f" − {rub(payroll)} − {rub(sc)}" if payroll else ""), diff))
+            own = own_contrib_steps(steps, diff, rub(diff))
             comps["Взносы ИП за себя"] = own
-            steps.append(f"Взносы ИП за себя: {rub(own)}")
         base = inc - exp - payroll - sc - own
+        how = f"выручка без НДС {rub(inc)} − расходы {rub(exp)}"
+        if payroll:
+            how += f" − зарплата {rub(payroll)} − взносы за сотрудников {rub(sc)}"
+        if own:
+            how += f" − взносы ИП {rub(own)}"
+        steps.append(("Налоговая база", how, base))
         tax = max(base, 0) * rate
+        steps.append(("Налог по ставке", f"{rub(max(base, 0))} × {pct(rate)} ({src})", tax))
         min_tax = inc * 0.01
-        steps.append(f"База: {rub(inc)} − расходы {rub(exp)} − ФОТ {rub(payroll)} − взносы {rub(sc + own)} = {rub(base)}")
-        if tax < min_tax:
-            steps.append(f"Налог {rub(tax)} меньше минимального (1% дохода) — платится {rub(min_tax)}")
-            tax = min_tax
-        else:
-            steps.append(f"Налог: {rub(max(base, 0))} × {rate * 100:g}% = {rub(tax)}")
-        comps["Налог"] = tax
+        steps.append(("Минимальный налог", f"{rub(inc)} × 1%", min_tax))
+        comps["Налог"] = max(tax, min_tax)
+        steps.append(("Налог УСН к уплате", "больший из двух: налог по ставке или минимальный", comps["Налог"]))
         regime = f"УСН «Д−Р» {rate_dr:g}%{mark_dr}{title_vat}"
 
     if form == "ООО":
         profit = inc - exp - payroll - sc - comps["Налог"]
-        comps["НДФЛ с дивидендов"] = progressive(max(profit, 0), DIV_SCALE)
-        steps.append(f"Чистая прибыль к выплате {rub(max(profit, 0))}, НДФЛ с дивидендов {rub(comps['НДФЛ с дивидендов'])}")
+        how = f"{rub(inc)} − {rub(exp)}" + (f" − {rub(payroll)} − {rub(sc)}" if payroll else "") + f" − налог {rub(comps['Налог'])}"
+        comps["НДФЛ с дивидендов"] = dividend_steps(steps, profit, how)
 
-    comps["Потери без НДС"] = vat_loss(p, vat_rate)
-    if comps["Потери без НДС"]:
-        steps.append(f"Скидка клиентам за отсутствие полного вычета НДС: {rub(comps['Потери без НДС'])}")
+    vat_loss_step(steps, p, vat_rate, comps)
     return result(form, regime, comps, steps, problems, p)
 
 
 def calc_osno(p, form):
-    income, payroll, staff = p["income"], p["payroll"], p["staff"]
+    payroll = p["payroll"]
     comps = dict.fromkeys(COMPONENTS, 0.0)
-    out_vat = income * VAT / (1 + VAT)
-    comps["НДС"] = out_vat - p["input_vat"]
-    inc, exp = income - out_vat, p["expenses"] - p["input_vat"]
-    steps = [f"НДС 22%: начислено {rub(out_vat)} − вычет {rub(p['input_vat'])} = {rub(comps['НДС'])}"]
-    sc = staff_contrib(payroll, staff, p["msp"])
+    steps = []
+    input_steps(steps, p)
+    comps["НДС"], inc, exp = vat22_steps(steps, p)
+    sc = staff_steps(steps, p)
     comps["Взносы за сотрудников"] = sc
     profit = inc - exp - payroll - sc
+    profit_how = f"{rub(inc)} − {rub(exp)}" + (f" − {rub(payroll)} − {rub(sc)}" if payroll else "")
     if form == "ИП":
-        own = ip_own_contrib(profit)
+        steps.append(("Прибыль (для взноса 1% и НДФЛ)", profit_how, profit))
+        own = own_contrib_steps(steps, profit, rub(profit))
         comps["Взносы ИП за себя"] = own
         base = max(profit - own, 0)
+        steps.append(("База НДФЛ", f"{rub(profit)} − взносы ИП {rub(own)}", base))
         comps["Налог"] = progressive(base, NDFL_SCALE)
-        steps.append(f"Взносы ИП за себя: {rub(own)}")
-        steps.append(f"НДФЛ по шкале 13–22% с {rub(base)} = {rub(comps['Налог'])}")
+        steps.append(("НДФЛ (прогрессивная шкала 13–22%)", progressive_how(base, NDFL_SCALE), comps["Налог"]))
     else:
+        steps.append(("Прибыль", profit_how, profit))
         comps["Налог"] = max(profit, 0) * 0.25
-        comps["НДФЛ с дивидендов"] = progressive(max(profit - comps["Налог"], 0), DIV_SCALE)
-        steps.append(f"Налог на прибыль 25% с {rub(max(profit, 0))} = {rub(comps['Налог'])}")
-        steps.append(f"НДФЛ с дивидендов: {rub(comps['НДФЛ с дивидендов'])}")
+        steps.append(("Налог на прибыль", f"{rub(max(profit, 0))} × 25%", comps["Налог"]))
+        comps["НДФЛ с дивидендов"] = dividend_steps(
+            steps, profit - comps["Налог"], f"{rub(profit)} − налог на прибыль {rub(comps['Налог'])}")
+    vat_loss_step(steps, p, VAT, comps)
     return result(form, "ОСНО", comps, steps, [], p)
 
 
@@ -219,28 +333,29 @@ def calc_ausn(p, form, obj):
         problems.append(f"доход выше {rub(AUSN_LIMIT)}")
     if staff > AUSN_STAFF:
         problems.append(f"сотрудников больше {AUSN_STAFF}")
-    steps = ["Взносы за сотрудников и фиксированные взносы ИП на АУСН не платятся"]
+    steps = []
+    input_steps(steps, p)
+    steps.append(("НДС, взносы ИП и взносы за сотрудников", "на АУСН не платятся", 0.0))
     if obj == "Д":
         comps["Налог"] = income * 0.08
-        steps.append(f"Налог: {rub(income)} × 8% = {rub(comps['Налог'])}")
+        steps.append(("Налог АУСН к уплате", f"выручка {rub(income)} × 8%", comps["Налог"]))
         regime = "АУСН «Доходы» 8%"
     else:
         base = income - expenses - payroll
+        steps.append(("Налоговая база", f"выручка {rub(income)} − расходы {rub(expenses)}"
+                                        + (f" − зарплата {rub(payroll)}" if payroll else ""), base))
         tax = max(base, 0) * 0.20
+        steps.append(("Налог по ставке", f"{rub(max(base, 0))} × 20%", tax))
         min_tax = income * AUSN_MIN
-        steps.append(f"База: {rub(income)} − расходы {rub(expenses)} − ФОТ {rub(payroll)} = {rub(base)}")
-        if tax < min_tax:
-            steps.append(f"Налог {rub(tax)} меньше минимального (3% дохода) — платится {rub(min_tax)}")
-            tax = min_tax
-        else:
-            steps.append(f"Налог: {rub(max(base, 0))} × 20% = {rub(tax)}")
-        comps["Налог"] = tax
+        steps.append(("Минимальный налог", f"{rub(income)} × 3%", min_tax))
+        comps["Налог"] = max(tax, min_tax)
+        steps.append(("Налог АУСН к уплате", "больший из двух: налог по ставке или минимальный", comps["Налог"]))
         regime = "АУСН «Д−Р» 20%"
     if form == "ООО":
         profit = income - expenses - payroll - comps["Налог"]
-        comps["НДФЛ с дивидендов"] = progressive(max(profit, 0), DIV_SCALE)
-        steps.append(f"НДФЛ с дивидендов: {rub(comps['НДФЛ с дивидендов'])}")
-    comps["Потери без НДС"] = vat_loss(p, 0.0)
+        how = f"{rub(income)} − {rub(expenses)}" + (f" − {rub(payroll)}" if payroll else "") + f" − налог {rub(comps['Налог'])}"
+        comps["НДФЛ с дивидендов"] = dividend_steps(steps, profit, how)
+    vat_loss_step(steps, p, 0.0, comps)
     return result(form, regime, comps, steps, problems, p)
 
 
@@ -318,6 +433,45 @@ XLSX_COLUMNS = [
     ("Собственнику", "Чистая прибыль собственнику ООО (после НДФЛ с дивидендов), ₽"),
     ("Статус", "Доступен ли"),
 ]
+
+
+PART_STEPS = ("к уплате", "Взносы ИП за себя, всего", "Взносы за сотрудников", "НДФЛ с дивидендов",
+              "НДФЛ (прогрессивная", "Налог на прибыль", "Скидка клиентам")
+TOTAL_STEPS = ("Налоговая нагрузка", "Чистая прибыль после", "Чистая прибыль собственнику")
+
+
+def is_part_step(name: str) -> bool:
+    """Шаг, сумма которого входит в налоговую нагрузку."""
+    return any(k in name for k in PART_STEPS) and not name.startswith("НДС начисленный")
+
+
+def is_total_step(name: str) -> bool:
+    return name.startswith(TOTAL_STEPS)
+
+
+def fmt_value(value) -> str:
+    if isinstance(value, str):
+        return value
+    return f"{value:,.2f} ₽".replace(",", " ").replace(".", ",")
+
+
+def steps_html(steps) -> str:
+    """Таблица «что считаем — как считаем — сумма» для вкладки «Подробный расчёт»."""
+    from html import escape
+    rows = []
+    for name, how, value in steps:
+        style = ""
+        if is_part_step(name):
+            style = "background:#E6F8CF;"
+        if is_total_step(name):
+            style += "font-weight:700;background:#C9F29B;"
+        rows.append(f'<tr style="{style}"><td>{escape(name)}</td><td>{escape(how)}</td>'
+                    f'<td class="num">{escape(fmt_value(value))}</td></tr>')
+    return ('<style>.steps-table{border-collapse:collapse;width:100%;font-size:14px}'
+            '.steps-table th,.steps-table td{border:1px solid #DCE8CF;padding:6px 10px;vertical-align:top;text-align:left}'
+            '.steps-table th{background:#E6F8CF}.steps-table td.num{text-align:right;white-space:nowrap}</style>'
+            '<div style="overflow-x:auto"><table class="steps-table"><tr><th>Что считаем</th>'
+            '<th>Откуда берём и как считаем</th><th>Сумма</th></tr>' + "".join(rows) + "</table></div>")
 
 
 PARAMS_SHEET = "_параметры"
@@ -425,29 +579,32 @@ def build_xlsx(p, rows, best) -> bytes:
 
     # Лист 3. Расчёт по шагам
     ws = wb.create_sheet("Расчёт по шагам")
-    ws.column_dimensions["A"].width = 100
-    ws.column_dimensions["B"].width = 20
+    ws.column_dimensions["A"].width = 40
+    ws.column_dimensions["B"].width = 90
+    ws.column_dimensions["C"].width = 18
+    part_fill = PatternFill("solid", fgColor="E6F8CF")
     for r in ordered:
         ws.append([r["Название"] + ("" if r["Доступен"] else " — недоступен: " + "; ".join(r["Причины"]))])
         ws.cell(ws.max_row, 1).font = Font(bold=True, size=12)
         if best and r["Название"] == best["Название"]:
             ws.cell(ws.max_row, 1).fill = best_fill
-        for s in r["Шаги"]:
-            ws.append(["• " + s])
-            ws.cell(ws.max_row, 1).alignment = wrap
-        summary = [(CHART_NAMES[k], r[k]) for k in COMPONENTS if r[k]]
-        summary += [("Налоговая нагрузка", r["Итого"]),
-                    ("Прибыль до налогов", r["Прибыль до налогов"]),
-                    ("Чистая прибыль после налогов", r["Чистая прибыль"])]
-        if r["Форма"] == "ООО":
-            summary.append(("Чистая прибыль собственнику (после НДФЛ с дивидендов)", r["Собственнику"]))
-        for name, value in summary:
-            ws.append([name, value])
-            ws.cell(ws.max_row, 2).number_format = money
-            if name.startswith(("Налоговая нагрузка", "Чистая прибыль")):
-                ws.cell(ws.max_row, 1).font = bold
-                ws.cell(ws.max_row, 2).font = bold
+        ws.append(["Что считаем", "Откуда берём и как считаем", "Сумма"])
+        for c in range(1, 4):
+            ws.cell(ws.max_row, c).font, ws.cell(ws.max_row, c).fill = bold, head_fill
+        for name, how, value in r["Шаги"]:
+            ws.append([name, how, value])
+            row = ws.max_row
+            ws.cell(row, 2).alignment = wrap
+            if isinstance(value, (int, float)):
+                ws.cell(row, 3).number_format = '#,##0.00 "₽"'
+            for c in range(1, 4):
+                ws.cell(row, c).border = border
+                if is_part_step(name):
+                    ws.cell(row, c).fill = part_fill
+                if is_total_step(name):
+                    ws.cell(row, c).font = bold
         ws.append([])
+    ws.append(["Салатовым выделены суммы, которые входят в налоговую нагрузку."])
 
     # Скрытый лист: из него калькулятор восстанавливает расчёт («Открыть сохранённый расчёт»)
     ws = wb.create_sheet(PARAMS_SHEET)
@@ -621,7 +778,7 @@ st.query_params.from_dict({k: encode(v) for k, v in ss["_saved"].items() if v !=
 
 input_vat = expenses * vat_share / 100 * VAT / (1 + VAT)
 p = dict(income=income, expenses=expenses, payroll=payroll, staff=int(staff), clients_vat=clients_vat,
-         vat_discount=vat_discount, usn_rates=usn_rates, msp=msp, input_vat=input_vat,
+         vat_discount=vat_discount, usn_rates=usn_rates, msp=msp, input_vat=input_vat, vat_share=vat_share,
          saved=dict(ss["_saved"]))
 
 if income <= 0:
@@ -753,13 +910,9 @@ with tab_detail:
     r = next(x for x in rows if x["Название"] == pick)
     if not r["Доступен"]:
         st.error("Режим недоступен: " + "; ".join(r["Причины"]))
-    for s in r["Шаги"]:
-        st.markdown(f"- {s}")
-    st.markdown(f"**Налоговая нагрузка: {rub(r['Итого'])} ({r['% от дохода']:.1f}% от выручки). "
-                f"Прибыль до налогов: {rub(r['Прибыль до налогов'])}. "
-                f"Чистая прибыль после налогов: {rub(r['Чистая прибыль'])}.**")
-    if r["Форма"] == "ООО":
-        st.markdown(f"**Чистая прибыль собственнику ООО (после НДФЛ с дивидендов): {rub(r['Собственнику'])}.**")
+    st.markdown("Расчёт по шагам на ваших цифрах: откуда берётся каждое число и на что умножается. "
+                "**Салатовым** выделены суммы, которые складываются в налоговую нагрузку.")
+    st.markdown(steps_html(r["Шаги"]), unsafe_allow_html=True)
     parts = {k: r[k] for k in COMPONENTS if r[k]}
     if parts:
         st.bar_chart(pd.Series(parts, name="₽"), horizontal=True)

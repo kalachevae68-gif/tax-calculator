@@ -795,7 +795,10 @@ best = min(available, key=lambda r: r["Итого"]) if available else None
 
 if best:
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Самый выгодный режим", best["Название"])
+    # своя плашка вместо st.metric: длинное название режима переносится, а не обрезается многоточием
+    c1.markdown(f'<div style="font-size:14px;margin-bottom:4px">Самый выгодный режим</div>'
+                f'<div style="font-size:21px;font-weight:600;line-height:1.3;color:#0B4D12">'
+                f'{best["Название"]}</div>', unsafe_allow_html=True)
     c2.metric("Прибыль до налогов", rub(best["Прибыль до налогов"]),
               help="Выручка с НДС минус расходы и зарплата сотрудников. Одинакова для всех вариантов.")
     c3.metric("Налоговая нагрузка", rub(best["Итого"]), f"{best['% от дохода']:.1f}% от выручки", delta_color="off")

@@ -113,7 +113,8 @@ def dividend_steps(steps, profit: float, profit_how: str) -> float:
     profit = max(profit, 0)
     steps.append(("Чистая прибыль к выплате дивидендами", profit_how, profit))
     ndfl = progressive(profit, DIV_SCALE)
-    steps.append(("НДФЛ с дивидендов", progressive_how(profit, DIV_SCALE), ndfl))
+    steps.append(("НДФЛ с дивидендов", "шкала для дивидендов: 13% с первых 2 400 000 ₽, 15% со всего, что больше. "
+                  "Расчёт: " + progressive_how(profit, DIV_SCALE), ndfl))
     return ndfl
 
 
@@ -314,7 +315,10 @@ def calc_osno(p, form):
         base = max(profit - own, 0)
         steps.append(("База НДФЛ", f"{rub(profit)} − взносы ИП {rub(own)}", base))
         comps["Налог"] = progressive(base, NDFL_SCALE)
-        steps.append(("НДФЛ (прогрессивная шкала 13–22%)", progressive_how(base, NDFL_SCALE), comps["Налог"]))
+        steps.append(("НДФЛ (прогрессивная шкала 13–22%)",
+                      "шкала НДФЛ для ИП: 13% до 2 400 000 ₽, 15% от 2 400 000 до 5 000 000 ₽, "
+                      "18% от 5 до 20 млн ₽, 20% от 20 до 50 млн ₽, 22% свыше 50 млн ₽. "
+                      "Расчёт: " + progressive_how(base, NDFL_SCALE), comps["Налог"]))
     else:
         steps.append(("Прибыль", profit_how, profit))
         comps["Налог"] = max(profit, 0) * 0.25
@@ -578,7 +582,7 @@ def build_xlsx(p, rows, best) -> bytes:
     ws.append(["Зелёным выделен самый выгодный вариант, серым — недоступные."])
 
     # Лист 3. Расчёт по шагам
-    ws = wb.create_sheet("Расчёт по шагам")
+    ws = wb.create_sheet("Из чего сложилась сумма")
     ws.column_dimensions["A"].width = 40
     ws.column_dimensions["B"].width = 90
     ws.column_dimensions["C"].width = 18
@@ -592,7 +596,7 @@ def build_xlsx(p, rows, best) -> bytes:
         for c in range(1, 4):
             ws.cell(ws.max_row, c).font, ws.cell(ws.max_row, c).fill = bold, head_fill
         for name, how, value in r["Шаги"]:
-            ws.append([name, how, value])
+            ws.append([name, how, round(value, 2) if isinstance(value, float) else value])
             row = ws.max_row
             ws.cell(row, 2).alignment = wrap
             if isinstance(value, (int, float)):
@@ -901,7 +905,7 @@ with tab_cmp:
         st.download_button("📥 Скачать расчёт в Excel", xlsx, file_name="Расчёт налогов.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                            type="primary")
-        st.caption("В файле три листа: исходные данные, сравнение всех вариантов и расчёт по шагам для каждого.")
+        st.caption("В файле три листа: исходные данные, сравнение всех вариантов и «Из чего сложилась сумма» — расчёт по шагам для каждого варианта: откуда берётся число, на что умножается и что вычитается.")
 
 with tab_detail:
     names = [r["Название"] for r in rows]

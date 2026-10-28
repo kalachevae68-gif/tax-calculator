@@ -33,8 +33,18 @@ INS_BASE = 2_979_000         # предельная база по страхов
 MROT = 27_093
 INJURY = 0.002               # взносы «на травматизм», минимальный класс риска
 
-COMPONENTS = ["Налог", "НДС", "Взносы ИП за себя", "Взносы за сотрудников",
+# ПСН: лимит доходов по году (подп. 1 п. 6 ст. 346.45 НК в ред. 425-ФЗ), с 2028 года — 10 млн ₽.
+# При совмещении с УСН складывается выручка по обоим режимам.
+PSN_LIMITS = {2026: 20_000_000, 2027: 15_000_000, 2028: 10_000_000}
+PSN_YEARS = tuple(PSN_LIMITS)
+PSN_STAFF = 15
+PSN_RATE = 0.06
+MONTHS_IN = ["январе", "феврале", "марте", "апреле", "мае", "июне", "июле", "августе",
+             "сентябре", "октябре", "ноябре", "декабре"]
+
+COMPONENTS = ["Налог", "Патент", "НДС", "Взносы ИП за себя", "Взносы за сотрудников",
               "НДФЛ с дивидендов", "Потери без НДС"]
+OPTIONAL = ("Патент", "Потери без НДС")  # графы, которые прячутся, если везде ноль
 
 
 def rub(x: float) -> str:
@@ -154,7 +164,7 @@ def staff_steps(steps, p) -> float:
 def result(form, regime, comps, steps, problems, p):
     total = sum(comps.values())
     pbt = p["income"] - p["expenses"] - p["payroll"]
-    names = {"Налог": "налог", "НДС": "НДС", "Взносы ИП за себя": "взносы ИП",
+    names = {"Налог": "налог", "Патент": "патент", "НДС": "НДС", "Взносы ИП за себя": "взносы ИП",
              "Взносы за сотрудников": "взносы за сотрудников", "НДФЛ с дивидендов": "НДФЛ с дивидендов",
              "Потери без НДС": "скидка клиентам"}
     used = [f"{names[k]} {rub(v)}" for k, v in comps.items() if v]
@@ -363,6 +373,193 @@ def calc_ausn(p, form, obj):
     return result(form, regime, comps, steps, problems, p)
 
 
+def psn_limit(year: int) -> int:
+    return PSN_LIMITS[min(year, max(PSN_LIMITS))]
+
+
+def psn_check(year: int, prev: float, cur: float, staff_psn: int):
+    """Право на патент в году: (причины, месяц превышения лимита или None)."""
+    limit = psn_limit(year)
+    problems, month = [], None
+    if prev > limit:
+        problems.append(f"доход за {year - 1} год {rub(prev)} больше лимита ПСН на {year} год {rub(limit)} — "
+                        "патент не выдадут")
+    elif cur > limit:
+        # выручка идёт равномерно по месяцам: ищем месяц, в котором итог с начала года превысит лимит
+        month = int(limit * 12 // cur) + 1
+        problems.append(f"доход {year} года {rub(cur)} больше лимита {rub(limit)}: превышение в {MONTHS_IN[month - 1]}, "
+                        "право на патент теряется с начала его срока")
+    if staff_psn > PSN_STAFF:
+        problems.append(f"на патенте больше {PSN_STAFF} сотрудников")
+    return problems, month
+
+
+def psn_objects(p):
+    """Если вся выручка на патенте, объект УСН не важен — один вариант."""
+    return ("Д",) if p["psn"]["share"] >= 100 else ("Д", "ДР")
+
+
+def calc_psn(p, obj, year=PSN_YEARS[0], prev=None):
+    """ИП: патент на часть выручки, остальное — УСН (obj 'Д' или 'ДР')."""
+    s = p["psn"]
+    income, payroll, staff, pvd = p["income"], p["payroll"], p["staff"], s["pvd"]
+    k = s["share"] / 100
+    psn_inc, usn_inc = income * k, income * (1 - k)
+    psn_staff = min(s["staff"], staff)
+    usn_staff = staff - psn_staff
+    comps = dict.fromkeys(COMPONENTS, 0.0)
+    steps = []
+    input_steps(steps, p)
+    steps.append(("Выручка по патенту", f"{rub(income)} × {s['share']}% (поле «Доля выручки на патенте»)", psn_inc))
+    if usn_inc:
+        steps.append(("Выручка по УСН", f"{rub(income)} − {rub(psn_inc)}", usn_inc))
+    problems, _ = psn_check(year, s["prev_income"] if prev is None else prev, income, psn_staff)
+
+    # по патенту НДС нет; освобождение на УСН — по выручке обоих режимов
+    vat_rate, title_vat = 0.0, ""
+    if usn_inc and income > USN_VAT_FREE:
+        vat_rate = 0.05 if income <= USN_VAT5_LIMIT else 0.07
+        r = round(vat_rate * 100)
+        comps["НДС"] = usn_inc * vat_rate / (1 + vat_rate)
+        steps.append((f"НДС {r}% к уплате", f"выручка по УСН {rub(usn_inc)} × {r} ÷ {100 + r}: выручка обоих режимов "
+                                            f"больше {rub(USN_VAT_FREE)}; по патенту НДС нет", comps["НДС"]))
+        title_vat = f" + НДС {r}%"
+    else:
+        steps.append(("НДС", "не платится: по патенту НДС нет" + (
+            f", на УСН — освобождение: выручка обоих режимов не больше {rub(USN_VAT_FREE)}" if usn_inc else ""), 0.0))
+    usn_net = usn_inc - comps["НДС"]
+    if usn_inc and income > USN_LIMIT:
+        problems.append(f"доход выше лимита УСН {rub(USN_LIMIT)}")
+    if usn_inc and staff > USN_STAFF:
+        problems.append(f"сотрудников больше {USN_STAFF}")
+
+    sc = staff_steps(steps, p)
+    comps["Взносы за сотрудников"] = sc
+    sc_psn = sc * psn_staff / staff if staff else 0.0
+    sc_usn = sc - sc_psn
+    if sc_psn and sc_usn:
+        steps.append(("Из них взносы за сотрудников на патенте", f"{rub(sc)} × {psn_staff} из {staff} чел.", sc_psn))
+    exp_usn = p["expenses"] * (1 - k)
+    pay_usn = payroll * usn_staff / staff if staff else 0.0
+
+    # взносы ИП: 1% с потенциального дохода по патенту плюс доход по УСН
+    if not usn_inc:
+        usn_base, usn_how = 0.0, ""
+    elif obj == "Д":
+        usn_base, usn_how = usn_net, f"доход по УСН {rub(usn_net)}"
+    else:
+        usn_base = max(usn_net - exp_usn - pay_usn - sc_usn, 0)
+        usn_how = f"доходы минус расходы по УСН {rub(usn_base)}"
+    base_1pct = usn_base + pvd
+    steps.append(("База для взноса 1%", (usn_how + " + " if usn_how else "")
+                  + f"потенциальный доход по патенту {rub(pvd)}", base_1pct))
+    own = own_contrib_steps(steps, base_1pct, rub(base_1pct))
+    comps["Взносы ИП за себя"] = own
+    own_psn = own * k
+    own_usn = own - own_psn
+    if usn_inc:
+        steps.append(("Взносы ИП за себя: доля патента",
+                      f"{rub(own)} × {s['share']}% — делятся между режимами пропорционально выручке", own_psn))
+
+    psn_tax = pvd * PSN_RATE
+    steps.append(("Налог по патенту до уменьшения", f"потенциальный доход {rub(pvd)} × 6%", psn_tax))
+    if psn_staff:
+        red = min(own_psn + sc_psn, psn_tax * 0.5)
+        how = (f"взносы {rub(own_psn)} + {rub(sc_psn)} = {rub(own_psn + sc_psn)}; на патенте есть сотрудники, "
+               f"поэтому не больше 50% налога: {rub(psn_tax * 0.5)}; берём меньшее")
+    else:
+        red = min(own_psn, psn_tax)
+        how = (f"взносы ИП {rub(own_psn)}; сотрудников на патенте нет — можно до нуля, "
+               f"но не больше налога {rub(psn_tax)}")
+    if red:
+        steps.append(("Уменьшение патента на взносы", how, -red))
+    comps["Патент"] = psn_tax - red
+    steps.append(("Налог по патенту к уплате", f"{rub(psn_tax)} − {rub(red)}", comps["Патент"]))
+
+    rate_d, mark_d, rate_dr, mark_dr = p["usn_rates"]["ИП"]
+    if not usn_inc:
+        regime = "ПСН (вся выручка на патенте)"
+    elif obj == "Д":
+        rate = rate_d / 100
+        src = "льготная ставка региона" if mark_d else "обычная ставка"
+        base_tax = usn_net * rate
+        steps.append(("Налог УСН до уменьшения", f"выручка по УСН без НДС {rub(usn_net)} × {pct(rate)} ({src})", base_tax))
+        if usn_staff:
+            reduce = min(own_usn + sc_usn, base_tax * 0.5)
+            how = (f"взносы {rub(own_usn)} + {rub(sc_usn)} = {rub(own_usn + sc_usn)}; на УСН есть сотрудники, "
+                   f"поэтому не больше 50% налога: {rub(base_tax * 0.5)}; берём меньшее")
+        else:
+            reduce = min(own_usn, base_tax)
+            how = f"доля взносов ИП на УСН {rub(own_usn)}, но не больше налога {rub(base_tax)}"
+        if reduce:
+            steps.append(("Уменьшение налога на взносы", how, -reduce))
+        comps["Налог"] = base_tax - reduce
+        steps.append(("Налог УСН к уплате", f"{rub(base_tax)} − {rub(reduce)}", comps["Налог"]))
+        regime = f"ПСН + УСН «Доходы» {rate_d:g}%{mark_d}{title_vat}"
+    else:
+        rate = rate_dr / 100
+        src = "льготная ставка региона" if mark_dr else "обычная ставка"
+        base = usn_net - exp_usn - pay_usn - sc_usn - own_usn
+        how = (f"выручка по УСН без НДС {rub(usn_net)} − расходы {rub(exp_usn)} "
+               f"({100 - s['share']}% расходов — по доле выручки)")
+        if pay_usn:
+            how += f" − зарплата {rub(pay_usn)} − взносы за сотрудников {rub(sc_usn)}"
+        how += f" − доля взносов ИП {rub(own_usn)}"
+        steps.append(("Налоговая база УСН", how, base))
+        tax = max(base, 0) * rate
+        steps.append(("Налог по ставке", f"{rub(max(base, 0))} × {pct(rate)} ({src})", tax))
+        min_tax = usn_net * 0.01
+        steps.append(("Минимальный налог", f"{rub(usn_net)} × 1%", min_tax))
+        comps["Налог"] = max(tax, min_tax)
+        steps.append(("Налог УСН к уплате", "больший из двух: налог по ставке или минимальный", comps["Налог"]))
+        regime = f"ПСН + УСН «Д−Р» {rate_dr:g}%{mark_dr}{title_vat}"
+
+    vat_loss_step(steps, p, vat_rate * (1 - k), comps)
+    return result("ИП", regime, comps, steps, problems, p)
+
+
+def psn_forecast(p):
+    """Патент на 2026–2028 годы: право, месяц превышения лимита, нагрузка с патентом и без."""
+    s = p["psn"]
+    g = s["growth"] / 100
+    psn_staff = min(s["staff"], p["staff"])
+    out = []
+    for i, year in enumerate(PSN_YEARS):
+        f = (1 + g) ** i
+        py = dict(p, income=p["income"] * f, expenses=p["expenses"] * f, payroll=p["payroll"] * f,
+                  input_vat=p["input_vat"] * f)
+        prev = s["prev_income"] if i == 0 else p["income"] * (1 + g) ** (i - 1)
+        problems, month = psn_check(year, prev, py["income"], psn_staff)
+        modes = (None,) if py["income"] <= USN_VAT_FREE else ("reduced", "full")
+        usn = [calc_usn(py, "ИП", o, m) for m in modes for o in ("Д", "ДР")]
+        usn = [r for r in usn if r["Доступен"]]
+        psn = [calc_psn(py, o, year, prev) for o in psn_objects(p)]
+        out.append(dict(year=year, limit=psn_limit(year), prev=prev, income=py["income"], problems=problems,
+                        month=month, usn=min(usn, key=lambda r: r["Итого"]) if usn else None,
+                        psn=min(psn, key=lambda r: r["Итого"])))
+    return out
+
+
+def psn_verdict(years) -> tuple[str, str]:
+    """Вывод по годам: (уровень сообщения, текст)."""
+    ok = [y["year"] for y in years if not y["problems"]]
+    bad = next((y for y in years if y["problems"]), None)
+    if not bad:
+        return "success", (f"Патент можно применять во всех годах: {', '.join(map(str, ok))}. "
+                           f"С 2028 года лимит {rub(psn_limit(2028))} — следите, чтобы выручка его не превышала.")
+    text = f"Патент можно применять: {', '.join(map(str, ok))} г. " if ok else ""
+    if bad["month"]:
+        text += (f"С патента клиент слетает в {bad['year']} году: в {MONTHS_IN[bad['month'] - 1]} выручка с начала "
+                 f"года превысит лимит {rub(bad['limit'])}. Право теряется с начала срока патента — налог за весь "
+                 "срок пересчитают по УСН, а уплаченный патент зачтут в налог УСН.")
+    else:
+        text += f"В {bad['year']} году патент не получить: " + "; ".join(bad["problems"]) + "."
+    later = [str(y["year"]) for y in years if y["year"] > bad["year"] and y["problems"]]
+    if later:
+        text += f" В {', '.join(later)} г. патент тоже недоступен."
+    return "error" if bad["year"] == PSN_YEARS[0] else "warning", text
+
+
 def calc_all(p):
     rows = []
     for form in ("ИП", "ООО"):
@@ -373,6 +570,8 @@ def calc_all(p):
                 rows += [calc_usn(p, form, "Д", mode), calc_usn(p, form, "ДР", mode)]
         rows.append(calc_osno(p, form))
         rows += [calc_ausn(p, form, "Д"), calc_ausn(p, form, "ДР")]
+        if form == "ИП" and p["psn"]:
+            rows += [calc_psn(p, o) for o in psn_objects(p)]
     return rows
 
 
@@ -400,6 +599,18 @@ def warnings(p, best):
     if p["clients_vat"] and best is not None and best["НДС"] == 0:
         w.append(("warning", "Клиентам важен входящий НДС, а самый выгодный режим работает без НДС. "
                              "Проверьте, готовы ли клиенты работать без вычета при заданной скидке."))
+    if p["psn"]:
+        s = p["psn"]
+        if s["staff"] > p["staff"]:
+            w.append(("warning", f"Сотрудников на патенте указано {s['staff']}, а всего {p['staff']} — "
+                                 f"в расчёте взято {p['staff']}."))
+        if not s["pvd"]:
+            w.append(("warning", "Не указан потенциальный доход по патенту — налог по патенту посчитан нулевым."))
+        w.append(("info", "Патент — только для ИП и только по видам деятельности из закона субъекта. "
+                          "Опт, поставка, продажа через маркетплейсы на патент не переводятся. "
+                          f"Лимит выручки по УСН и патенту вместе: {rub(PSN_LIMITS[2026])} в 2026 году, "
+                          f"{rub(PSN_LIMITS[2027])} в 2027 году, {rub(PSN_LIMITS[2028])} с 2028 года — "
+                          "и за прошлый год, и с начала текущего."))
     return w
 
 
@@ -408,6 +619,7 @@ def warnings(p, best):
 # ---------------------------------------------------------------------------
 CHART_NAMES = {
     "Налог": "Налог по системе",
+    "Патент": "Налог по патенту",
     "НДС": "НДС к уплате",
     "Взносы ИП за себя": "Взносы ИП за себя",
     "Взносы за сотрудников": "Взносы за сотрудников",
@@ -416,6 +628,7 @@ CHART_NAMES = {
 }
 CHART_COLORS = {
     "Налог": "#FF8A00",
+    "Патент": "#E0B300",
     "НДС": "#0A6CFF",
     "Взносы ИП за себя": "#9B6BC4",
     "Взносы за сотрудников": "#12A33A",
@@ -425,6 +638,7 @@ CHART_COLORS = {
 XLSX_COLUMNS = [
     ("Название", "Вариант"),
     ("Налог", "Налог по системе (УСН / НДФЛ / на прибыль), ₽"),
+    ("Патент", "Налог по патенту, ₽"),
     ("НДС", "НДС к уплате, ₽"),
     ("Взносы ИП за себя", "Взносы ИП за себя, ₽"),
     ("Взносы за сотрудников", "Взносы за сотрудников, ₽"),
@@ -481,8 +695,8 @@ def steps_html(steps) -> str:
 PARAMS_SHEET = "_параметры"
 
 
-def build_xlsx(p, rows, best) -> bytes:
-    """Файл Excel: исходные данные, сравнение вариантов, расчёт по шагам."""
+def build_xlsx(p, rows, best, years=None) -> bytes:
+    """Файл Excel: исходные данные, сравнение вариантов, расчёт по шагам, патент по годам."""
     import io
 
     from openpyxl import Workbook
@@ -522,6 +736,15 @@ def build_xlsx(p, rows, best) -> bytes:
     ]
     if p["clients_vat"]:
         data.append(("Скидка клиентам без НДС, %", p["vat_discount"], "0"))
+    if p["psn"]:
+        s = p["psn"]
+        data += [
+            ("Потенциальный доход по патенту за год", s["pvd"], money),
+            ("Доля выручки на патенте, %", s["share"], "0"),
+            ("Сотрудников на патенте", s["staff"], "0"),
+            (f"Выручка за {PSN_YEARS[0] - 1} год (УСН и патент)", s["prev_income"], money),
+            ("Рост выручки в следующие годы, % в год", s["growth"], "0"),
+        ]
     for name, value, fmt in data:
         ws.append([name + (", ₽" if fmt == money else ""), round(value, 2) if isinstance(value, float) else value])
         if fmt:
@@ -544,7 +767,7 @@ def build_xlsx(p, rows, best) -> bytes:
     # Лист 2. Сравнение
     ws = wb.create_sheet("Сравнение")
     ordered = sorted(rows, key=lambda r: (not r["Доступен"], r["Итого"]))
-    cols = [(k, h) for k, h in XLSX_COLUMNS if k != "Потери без НДС" or any(r["Потери без НДС"] for r in rows)]
+    cols = [(k, h) for k, h in XLSX_COLUMNS if k not in OPTIONAL or any(r[k] for r in rows)]
     ws.append([h for _, h in cols])
     for c in range(1, len(cols) + 1):
         cell = ws.cell(1, c)
@@ -615,6 +838,39 @@ def build_xlsx(p, rows, best) -> bytes:
         ws.append([])
     ws.append(["Салатовым выделены суммы, которые входят в налоговую нагрузку."])
 
+    # Лист 4. Патент по годам
+    if years:
+        ws = wb.create_sheet("Патент по годам")
+        ws.append(["Год", "Лимит ПСН, ₽", "Выручка прошлого года, ₽", "Выручка года, ₽", "Патент",
+                   "Нагрузка с патентом, ₽", "Лучший вариант с патентом", "Нагрузка на УСН без патента, ₽",
+                   "Лучший вариант без патента", "Экономия от патента, ₽"])
+        for c in range(1, 11):
+            cell = ws.cell(1, c)
+            cell.font, cell.fill, cell.alignment, cell.border = bold, head_fill, wrap, border
+        ws.row_dimensions[1].height = 45
+        for y in years:
+            usn = y["usn"]["Итого"] if y["usn"] else None
+            psn = None if y["problems"] else y["psn"]["Итого"]
+            ws.append([y["year"], y["limit"], round(y["prev"], 2), round(y["income"], 2),
+                       "можно" if not y["problems"] else "нельзя: " + "; ".join(y["problems"]),
+                       round(psn, 2) if psn is not None else "—",
+                       y["psn"]["Режим"] if psn is not None else "—",
+                       round(usn, 2) if usn is not None else "—",
+                       y["usn"]["Режим"] if y["usn"] else "—",
+                       round(usn - psn, 2) if usn is not None and psn is not None else "—"])
+            row = ws.max_row
+            for c in range(1, 11):
+                ws.cell(row, c).border = border
+                ws.cell(row, c).alignment = wrap
+                if c in (2, 3, 4, 6, 8, 10):
+                    ws.cell(row, c).number_format = money
+        for c, w in enumerate((8, 16, 18, 18, 50, 18, 34, 18, 34, 18), start=1):
+            ws.column_dimensions[get_column_letter(c)].width = w
+        ws.append([])
+        ws.append([psn_verdict(years)[1]])
+        ws.append(["Прогноз: выручка, расходы и ФОТ растут на заданный процент в год; потенциальный доход "
+                   "по патенту и ставки взносов — как в 2026 году."])
+
     # Скрытый лист: из него калькулятор восстанавливает расчёт («Открыть сохранённый расчёт»)
     ws = wb.create_sheet(PARAMS_SHEET)
     for k, v in p["saved"].items():
@@ -661,6 +917,8 @@ DEFAULTS = {
     "income": "12 000 000", "expenses": "5 000 000", "input_vat": "0", "staff": 2, "payroll": "1 200 000",
     "clients_vat": False, "vat_discount": 15, "rate_kind": "Обычная: 6% и 15%",
     "lg_d": None, "lg_dr": None, "lg_ooo": True, "msp": False,
+    "psn_on": False, "psn_pvd": "1 000 000", "psn_share": 100, "psn_staff": 0, "prev_income": "12 000 000",
+    "growth": 0,
 }
 RATE_KINDS = ["Обычная: 6% и 15%", "Льготная ставка региона"]
 
@@ -717,7 +975,7 @@ def money_input(label: str, key: str, help: str | None = None) -> int:
 
 
 st.title("🧮 Какую систему налогообложения выбрать")
-st.caption("ИП и ООО: УСН, ОСНО, АУСН. Правила 2026 года. Расчёт ориентировочный — "
+st.caption("ИП и ООО: УСН, ОСНО, АУСН, патент. Правила 2026 года. Расчёт ориентировочный — "
            "итоговое решение принимает бухгалтер с учётом всех обстоятельств.")
 
 with st.sidebar:
@@ -785,6 +1043,28 @@ with st.sidebar:
         msp = st.checkbox("Льготный тариф взносов МСП (15% свыше 1,5 МРОТ)", key="msp",
                           help="С 2026 года льгота сохранена не для всех отраслей — уточните по своему ОКВЭД.")
 
+    st.subheader("Патент")
+    psn = None
+    if st.checkbox("Посчитать патент для ИП", key="psn_on",
+                   help="Патент на часть или всю выручку, остальное — на УСН. Плюс проверка права "
+                        "на патент в 2026, 2027 и 2028 годах."):
+        pvd = money_input("Потенциальный доход по патенту за год, ₽", "psn_pvd",
+                          help="Из закона субъекта о ПСН на 12 месяцев, по всем патентам вместе. "
+                               "Налог по патенту = 6% от этой суммы.")
+        share = st.slider("Доля выручки на патенте, %", 0, 100, key="psn_share",
+                          help="Какая часть выручки идёт от деятельности на патенте. Остальное — УСН.")
+        st.caption(f"По патенту {rub(income * share / 100)}, по УСН {rub(income * (1 - share / 100))}. "
+                   "Расходы делятся по той же доле.")
+        psn_staff = st.number_input("Из них сотрудников на патенте", min_value=0, step=1, key="psn_staff",
+                                    help=f"Не больше {PSN_STAFF}. Если есть — патент уменьшается на взносы "
+                                         "не больше чем на 50%.")
+        prev_income = money_input(f"Выручка за {PSN_YEARS[0] - 1} год, ₽", "prev_income",
+                                  help="УСН и патент вместе. По ней проверяется право на патент в 2026 году.")
+        growth = st.number_input("Рост выручки в 2027 и 2028 годах, % в год", min_value=-90, max_value=500,
+                                 step=5, key="growth",
+                                 help="Для прогноза: на сколько процентов в год вырастет выручка. 0 — останется как сейчас.")
+        psn = dict(pvd=pvd, share=share, staff=int(psn_staff), prev_income=prev_income, growth=growth)
+
     st.caption("💾 Введённые цифры сохраняются в адресе страницы: если обновить браузер, они не пропадут. "
                "Чтобы вернуться к расчёту позже, добавьте страницу в закладки или скачайте расчёт в Excel.")
 
@@ -796,7 +1076,7 @@ st.query_params.from_dict({k: encode(v) for k, v in ss["_saved"].items() if v !=
 
 input_vat = min(input_vat, expenses * VAT / (1 + VAT))
 p = dict(income=income, expenses=expenses, payroll=payroll, staff=int(staff), clients_vat=clients_vat,
-         vat_discount=vat_discount, usn_rates=usn_rates, msp=msp, input_vat=input_vat,
+         vat_discount=vat_discount, usn_rates=usn_rates, msp=msp, input_vat=input_vat, psn=psn,
          saved=dict(ss["_saved"]))
 
 if income <= 0:
@@ -806,6 +1086,7 @@ if income <= 0:
 rows = calc_all(p)
 available = [r for r in rows if r["Доступен"]]
 best = min(available, key=lambda r: r["Итого"]) if available else None
+years = psn_forecast(p) if psn else None
 
 if best:
     c1, c2, c3, c4 = st.columns(4)
@@ -819,7 +1100,12 @@ if best:
     c4.metric("Чистая прибыль после налогов", rub(best["Собственнику"]),
               help="Прибыль до налогов минус налоговая нагрузка. У ООО — после НДФЛ с дивидендов.")
 
-tab_cmp, tab_detail, tab_warn, tab_about = st.tabs(["📊 Сравнение", "🔍 Подробный расчёт", "⚠️ Предупреждения", "ℹ️ Допущения"])
+if years:
+    level, text = psn_verdict(years)
+    getattr(st, level)("**Патент.** " + text)
+
+tab_cmp, tab_psn, tab_detail, tab_warn, tab_about = st.tabs(
+    ["📊 Сравнение", "🗓 Патент по годам", "🔍 Подробный расчёт", "⚠️ Предупреждения", "ℹ️ Допущения"])
 
 with tab_cmp:
     df = pd.DataFrame(rows).sort_values(["Доступен", "Итого"], ascending=[False, True])
@@ -866,6 +1152,7 @@ with tab_cmp:
     names_map = {
         "Режим": "Вариант",
         "Налог": "Налог по системе (УСН / НДФЛ / на прибыль)",
+        "Патент": "Налог по патенту",
         "НДС": "НДС к уплате",
         "Взносы ИП за себя": "Взносы ИП за себя",
         "Взносы за сотрудников": "Взносы за сотрудников",
@@ -883,8 +1170,7 @@ with tab_cmp:
         table[c] = table[c].map(lambda v: f"{v:,.0f}".replace(",", " "))
     table.loc[~table["Режим"].str.startswith("ООО"), "Собственнику"] = "—"
     table["% от дохода"] = table["% от дохода"].map(lambda v: f"{v:.1f}%".replace(".", ","))
-    if not table["Потери без НДС"].ne("0").any():
-        table = table.drop(columns=["Потери без НДС"])
+    table = table.drop(columns=[c for c in OPTIONAL if not table[c].ne("0").any()])
     table = table.rename(columns=names_map)
 
     def highlight(row):
@@ -914,7 +1200,7 @@ with tab_cmp:
     st.markdown(f'<div class="cmp-wrap">{html}</div>', unsafe_allow_html=True)
 
     try:
-        xlsx = build_xlsx(p, rows, best)
+        xlsx = build_xlsx(p, rows, best, years)
     except ImportError:
         st.warning("Для скачивания в Excel поставьте библиотеку: закройте калькулятор (Ctrl+C в чёрном окне), "
                    "выполните `pip install openpyxl` и снова `streamlit run app.py`.")
@@ -923,6 +1209,59 @@ with tab_cmp:
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                            type="primary")
         st.caption("В файле три листа: исходные данные, сравнение всех вариантов и «Из чего сложилась сумма» — расчёт по шагам для каждого варианта: откуда берётся число, на что умножается и что вычитается.")
+
+with tab_psn:
+    if not years:
+        st.info("Включите «Посчитать патент для ИП» в панели слева: появятся варианты «ПСН + УСН» в сравнении "
+                "и проверка права на патент по годам.")
+    else:
+        st.markdown(f"**Лимит выручки для патента** (УСН и патент вместе): {rub(PSN_LIMITS[2026])} в 2026 году, "
+                    f"{rub(PSN_LIMITS[2027])} в 2027 году, {rub(PSN_LIMITS[2028])} с 2028 года. Проверяется дважды: "
+                    "выручка за прошлый год — можно ли получить патент, и выручка с начала текущего года — "
+                    "не слетит ли клиент в течение года. Если лимит превышен в течение года, право теряется "
+                    "с начала срока патента: налог за весь срок пересчитывают по УСН, а уплаченный патент "
+                    "засчитывают в налог УСН. Новый патент — не раньше следующего года.")
+        g = psn["growth"]
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            name="Выручка года" + (f" (прогноз +{g}% в год)" if g > 0 else f" (прогноз {g}% в год)" if g else ""),
+            x=[str(y["year"]) for y in years], y=[y["income"] / 1_000_000 for y in years],
+            marker=dict(color=["#12A33A" if not y["problems"] else "#D9534F" for y in years]),
+            customdata=[y["income"] for y in years], hovertemplate="%{x}: %{customdata:,.0f} ₽<extra></extra>"))
+        fig.add_trace(go.Scatter(
+            name="Лимит ПСН", x=[str(y["year"]) for y in years], y=[y["limit"] / 1_000_000 for y in years],
+            mode="lines+markers", line=dict(color="#333333", dash="dash", shape="hvh"),
+            hovertemplate="Лимит %{x}: %{y:,.0f} млн ₽<extra></extra>"))
+        fig.update_layout(title="Выручка и лимит патента по годам: зелёный — патент можно, красный — нельзя",
+                          yaxis=dict(title="млн ₽", tickformat=",.1f"), height=360, separators=", ",
+                          legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0),
+                          margin=dict(l=10, r=10, t=90, b=10))
+        st.plotly_chart(fig, width="stretch")
+
+        lines = []
+        for y in years:
+            psn_total = None if y["problems"] else y["psn"]["Итого"]
+            usn_total = y["usn"]["Итого"] if y["usn"] else None
+            lines.append({
+                "Год": str(y["year"]),
+                "Лимит ПСН": rub(y["limit"]),
+                "Выручка прошлого года": rub(y["prev"]),
+                "Выручка года": rub(y["income"]),
+                "Патент": "✅ можно" if not y["problems"] else "⛔ " + "; ".join(y["problems"]),
+                "Нагрузка с патентом": (f"{rub(psn_total)} ({y['psn']['Режим']})"
+                                        if psn_total is not None else "—"),
+                "Нагрузка на УСН без патента": (f"{rub(usn_total)} ({y['usn']['Режим']})"
+                                                if usn_total is not None else "—"),
+                "Экономия от патента": (rub(usn_total - psn_total)
+                                        if psn_total is not None and usn_total is not None else "—"),
+            })
+        html = pd.DataFrame(lines).style.hide(axis="index").set_table_attributes('class="cmp-table"').to_html()
+        st.markdown('<div class="cmp-wrap">' + "".join(l.strip() for l in html.splitlines()) + "</div>",
+                    unsafe_allow_html=True)
+        st.caption("Прогноз на 2027–2028 годы: выручка, расходы и ФОТ растут на заданный процент в год, выручка "
+                   "идёт равномерно по месяцам. Потенциальный доход по патенту и ставки взносов взяты как в 2026 "
+                   "году — на 2027–2028 годы они ещё не утверждены. Подробный расчёт 2026 года — в сравнении "
+                   "и на вкладке «Подробный расчёт», варианты «ИП · ПСН + УСН».")
 
 with tab_detail:
     names = [r["Название"] for r in rows]
@@ -955,6 +1294,13 @@ with tab_about:
 - Взносы за сотрудников: 30% до {rub(INS_BASE)} на человека и 15,1% сверх, плюс 0,2% «на травматизм».
 - АУСН: 8% или 20% (минимум 3% от дохода), без взносов за сотрудников и за себя.
 - НДФЛ сотрудников удерживается из их зарплаты и в нагрузку бизнеса не входит.
+- Патент (только ИП, совмещение с УСН): налог 6% от потенциального дохода по закону субъекта на 12 месяцев.
+  Лимит выручки по УСН и патенту вместе — {rub(PSN_LIMITS[2026])} в 2026 году, {rub(PSN_LIMITS[2027])} в 2027,
+  {rub(PSN_LIMITS[2028])} с 2028 года, проверяется за прошлый год и с начала текущего; на патенте не больше
+  {PSN_STAFF} сотрудников. Взнос 1% считается с потенциального дохода по патенту плюс доход по УСН.
+  Взносы ИП за себя делятся между патентом и УСН пропорционально выручке, расходы — тоже.
+  Патент уменьшается на взносы полностью, если на нём нет сотрудников, иначе — не больше чем на 50%.
+  Налог по патенту НДС не облагается, освобождение от НДС на УСН — по выручке обоих режимов.
 
 **Почему цифры могут не совпасть с ручным расчётом в Excel**
 - ИП на ОСНО: НДФЛ считается по прогрессивной шкале 13 / 15 / 18 / 20 / 22%, а не ровно 18% со всей прибыли.
@@ -964,6 +1310,7 @@ with tab_about:
   только для 1%, а не сумма взносов.
 - Уменьшение налога на взносы не бывает отрицательным: налог уменьшается на взносы, но не больше лимита (100% или 50%).
 
-**Чего калькулятор не учитывает:** зарплату собственника ООО вместо дивидендов, патент, торговый сбор,
+**Чего калькулятор не учитывает:** зарплату собственника ООО вместо дивидендов, патент вместе с ОСНО,
+патент на часть года, торговый сбор,
 имущественные налоги, региональные льготы кроме ставки УСН, освобождение от НДС по ст. 145 НК РФ на ОСНО.
 """)

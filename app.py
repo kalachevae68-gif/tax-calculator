@@ -138,7 +138,8 @@ def dividend_steps(steps, profit: float, profit_how: str) -> float:
 
 
 def input_steps(steps, p):
-    steps.append(("Выручка с НДС", "поле «Выручка за год (с НДС)»", p["income"]))
+    steps.append(("Выручка за год", "поле «Выручка за год (с НДС)» — вся сумма от покупателей; "
+                                    "если НДС есть, он внутри неё", p["income"]))
     steps.append(("Расходы", "поле «Расходы за год»", p["expenses"]))
     if p.get("raised_from") is not None:
         steps.append(("Зарплата сотрудников (поднята для льготы общепита)",
@@ -159,7 +160,8 @@ def food_steps(steps, p, ex: float):
     how = f"{rub(income)} × доля общепита {f['share']}%"
     if months < 12:
         how += f" × {months} из 12 месяцев (послабление 104-ФЗ действует с апреля по декабрь)"
-    steps.append(("Выручка общепита без НДС (подп. 38 п. 3 ст. 149 НК)", how, free))
+    steps.append(("Выручка общепита, освобождённая от НДС (подп. 38 п. 3 ст. 149 НК)",
+                  how + " — НДС в ней нет, вся сумма остаётся доходом", free))
     steps.append(("Выручка, облагаемая НДС", f"{rub(income)} − {rub(free)}", income - free))
     return income - free
 
@@ -283,10 +285,14 @@ def calc_usn(p, form, obj, vat_mode, food=False):
         k = round(vat_rate * 100)
         taxed = food_steps(steps, p, ex)
         comps["НДС"] = taxed * vat_rate / (1 + vat_rate)
-        steps.append((f"НДС {k}% к уплате", f"{rub(taxed)} × {k} ÷ {100 + k} (вычетов на этой ставке нет; "
-                                            "ставка — по всем доходам)", comps["НДС"]))
         inc, exp = income - comps["НДС"], p["expenses"]
-        steps.append(("Выручка без НДС", f"{rub(income)} − {rub(comps['НДС'])}", inc))
+        if taxed:
+            steps.append((f"НДС {k}% к уплате", f"{rub(taxed)} × {k} ÷ {100 + k} (вычетов на этой ставке нет; "
+                                                "ставка — по всем доходам)", comps["НДС"]))
+            steps.append(("Выручка без НДС", f"{rub(income)} − {rub(comps['НДС'])}", inc))
+        else:
+            steps.append(("НДС к уплате", "не начисляется: вся выручка освобождена от НДС, "
+                                          "доход для УСН — вся сумма выручки", 0.0))
         title_vat = f" + НДС {k}%"
     else:
         vat_rate = VAT
@@ -305,12 +311,13 @@ def calc_usn(p, form, obj, vat_mode, food=False):
     comps["Взносы за сотрудников"] = sc
 
     rate_d, mark_d, rate_dr, mark_dr = p["usn_rates"][form]
+    rev = "выручка без НДС" if comps["НДС"] else "выручка (НДС нет)"
 
     if obj == "Д":
         rate = rate_d / 100
         src = "льготная ставка региона" if mark_d else "обычная ставка"
         base_tax = inc * rate
-        steps.append(("Налог УСН до уменьшения", f"выручка без НДС {rub(inc)} × {pct(rate)} ({src})", base_tax))
+        steps.append(("Налог УСН до уменьшения", f"{rev} {rub(inc)} × {pct(rate)} ({src})", base_tax))
         if form == "ИП":
             own = own_contrib_steps(steps, inc, rub(inc))
             comps["Взносы ИП за себя"] = own
@@ -341,7 +348,7 @@ def calc_usn(p, form, obj, vat_mode, food=False):
             own = own_contrib_steps(steps, diff, rub(diff))
             comps["Взносы ИП за себя"] = own
         base = inc - exp - payroll - sc - own
-        how = f"выручка без НДС {rub(inc)} − расходы {rub(exp)}"
+        how = f"{rev} {rub(inc)} − расходы {rub(exp)}"
         if payroll:
             how += f" − зарплата {rub(payroll)} − взносы за сотрудников {rub(sc)}"
         if own:

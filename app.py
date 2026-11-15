@@ -42,9 +42,18 @@ PSN_RATE = 0.06
 MONTHS_IN = ["январе", "феврале", "марте", "апреле", "мае", "июне", "июле", "августе",
              "сентябре", "октябре", "ноябре", "декабре"]
 
+# Общепит: освобождение от НДС по подп. 38 п. 3 ст. 149 НК. Условия — по итогам прошлого года.
+FOOD_LIMIT = 3_000_000_000   # доходы за прошлый год, все поступления
+FOOD_SHARE = 70              # доля доходов от услуг общепита, не менее, %
+# Послабление 104-ФЗ: с 01.04.2026 по 31.12.2026 без условия о зарплате, если освобождение по ст. 145
+# на УСН или право на ПСН утрачено с 01.01.2026 и доход за 2025 год не больше 60 млн ₽
+FOOD_SOFT_LIMIT = 60_000_000
+FOOD_SOFT_MONTHS = 9         # апрель — декабрь 2026 года
+FOOD_TAG = " · льгота общепита"
+
 COMPONENTS = ["Налог", "Патент", "НДС", "Взносы ИП за себя", "Взносы за сотрудников",
-              "НДФЛ с дивидендов", "Потери без НДС"]
-OPTIONAL = ("Патент", "Потери без НДС")  # графы, которые прячутся, если везде ноль
+              "НДФЛ с дивидендов", "Потери без НДС", "Доплата зарплаты"]
+OPTIONAL = ("Патент", "Потери без НДС", "Доплата зарплаты")  # графы, которые прячутся, если везде ноль
 
 
 def rub(x: float) -> str:
@@ -131,23 +140,52 @@ def dividend_steps(steps, profit: float, profit_how: str) -> float:
 def input_steps(steps, p):
     steps.append(("Выручка с НДС", "поле «Выручка за год (с НДС)»", p["income"]))
     steps.append(("Расходы", "поле «Расходы за год»", p["expenses"]))
-    if p["payroll"]:
+    if p.get("raised_from") is not None:
+        steps.append(("Зарплата сотрудников (поднята для льготы общепита)",
+                      f"средняя зарплата по классу 56 в регионе {rub(p['food']['region'])} × 12 мес. × "
+                      f"{p['staff']} чел.; без повышения — {rub(p['raised_from'])}", p["payroll"]))
+    elif p["payroll"]:
         steps.append(("Зарплата сотрудников", "поле «Фонд оплаты труда за год»", p["payroll"]))
 
 
-def vat22_steps(steps, p):
-    """НДС 22% с вычетом: (НДС к уплате, выручка без НДС, расходы без НДС)."""
+def food_steps(steps, p, ex: float):
+    """Выручка, освобождённая от НДС как услуги общепита: (облагаемая выручка, доля освобождения)."""
+    income = p["income"]
+    if not ex:
+        return income
+    f = p["food"]
+    months = f["months"]
+    free = income * ex
+    how = f"{rub(income)} × доля общепита {f['share']}%"
+    if months < 12:
+        how += f" × {months} из 12 месяцев (послабление 104-ФЗ действует с апреля по декабрь)"
+    steps.append(("Выручка общепита без НДС (подп. 38 п. 3 ст. 149 НК)", how, free))
+    steps.append(("Выручка, облагаемая НДС", f"{rub(income)} − {rub(free)}", income - free))
+    return income - free
+
+
+def vat22_steps(steps, p, ex: float = 0.0):
+    """НДС 22% с вычетом: (НДС к уплате, выручка без НДС, расходы без НДС).
+    ex — доля выручки, освобождённой от НДС (общепит): входной НДС по ней к вычету не принимается."""
     income, expenses = p["income"], p["expenses"]
-    out_vat = income * VAT / (1 + VAT)
-    steps.append(("НДС начисленный 22%", f"{rub(income)} × 22 ÷ 122 (НДС, который сидит в выручке)", out_vat))
-    steps.append(("НДС входящий (вычет)",
-                  "поле «в т.ч. входящий НДС к вычету» — НДС из счетов поставщиков, он уже входит в расходы",
-                  p["input_vat"]))
-    vat = out_vat - p["input_vat"]
-    steps.append(("НДС к уплате", f"{rub(out_vat)} − {rub(p['input_vat'])}", vat))
-    inc, exp = income - out_vat, expenses - p["input_vat"]
+    taxed = food_steps(steps, p, ex)
+    out_vat = taxed * VAT / (1 + VAT)
+    steps.append(("НДС начисленный 22%", f"{rub(taxed)} × 22 ÷ 122 (НДС, который сидит в выручке)", out_vat))
+    deduct = p["input_vat"] * (1 - ex)
+    if ex:
+        steps.append(("НДС входящий (вычет)",
+                      f"входящий НДС {rub(p['input_vat'])} × {pct(1 - ex)} — доля облагаемой выручки (раздельный "
+                      f"учёт, п. 4.1 ст. 170 НК); остальные {rub(p['input_vat'] - deduct)} к вычету не принимаются "
+                      "и остаются в расходах", deduct))
+    else:
+        steps.append(("НДС входящий (вычет)",
+                      "поле «в т.ч. входящий НДС к вычету» — НДС из счетов поставщиков, он уже входит в расходы",
+                      deduct))
+    vat = out_vat - deduct
+    steps.append(("НДС к уплате", f"{rub(out_vat)} − {rub(deduct)}", vat))
+    inc, exp = income - out_vat, expenses - deduct
     steps.append(("Выручка без НДС", f"{rub(income)} − {rub(out_vat)}", inc))
-    steps.append(("Расходы без НДС", f"{rub(expenses)} − {rub(p['input_vat'])}", exp))
+    steps.append(("Расходы без НДС", f"{rub(expenses)} − {rub(deduct)}", exp))
     return vat, inc, exp
 
 
@@ -162,18 +200,26 @@ def staff_steps(steps, p) -> float:
 # Расчёт режимов. Шаг расчёта — (что считаем, откуда берём и как считаем, сумма)
 # ---------------------------------------------------------------------------
 def result(form, regime, comps, steps, problems, p):
+    base_pay = p["payroll"] if p.get("raised_from") is None else p["raised_from"]
+    if p.get("raised_from") is not None:
+        comps["Доплата зарплаты"] = p["payroll"] - p["raised_from"]
+        steps = steps + [("Доплата зарплаты до средней по региону",
+                          f"{rub(p['payroll'])} − {rub(p['raised_from'])}: расход ради льготы, считаем в нагрузке, "
+                          "чтобы сравнение с вариантами без льготы было честным", comps["Доплата зарплаты"])]
     total = sum(comps.values())
-    pbt = p["income"] - p["expenses"] - p["payroll"]
+    pbt = p["income"] - p["expenses"] - base_pay
     names = {"Налог": "налог", "Патент": "патент", "НДС": "НДС", "Взносы ИП за себя": "взносы ИП",
              "Взносы за сотрудников": "взносы за сотрудников", "НДФЛ с дивидендов": "НДФЛ с дивидендов",
-             "Потери без НДС": "скидка клиентам"}
+             "Потери без НДС": "скидка клиентам", "Доплата зарплаты": "доплата зарплаты"}
     used = [f"{names[k]} {rub(v)}" for k, v in comps.items() if v]
     steps = steps + [
         ("Налоговая нагрузка", " + ".join(used) if used else "налогов нет", total),
         ("Налоговая нагрузка, % от выручки", f"{rub(total)} ÷ {rub(p['income'])} × 100",
          f"{total / p['income'] * 100:.1f}%".replace(".", ",") if p["income"] else "—"),
         ("Прибыль до налогов", f"выручка {rub(p['income'])} − расходы {rub(p['expenses'])}"
-                               + (f" − зарплата {rub(p['payroll'])}" if p["payroll"] else ""), pbt),
+                               + (f" − зарплата {rub(base_pay)}" if base_pay else "")
+                               + (" (без повышения, доплата — в нагрузке)" if p.get("raised_from") is not None else ""),
+         pbt),
         ("Чистая прибыль после налогов",
          f"{rub(pbt)} − налоговая нагрузка без НДФЛ с дивидендов {rub(total - comps['НДФЛ с дивидендов'])}",
          pbt - total + comps["НДФЛ с дивидендов"]),
@@ -213,12 +259,18 @@ def vat_loss_step(steps, p, vat_rate, comps):
                       comps["Потери без НДС"]))
 
 
-def calc_usn(p, form, obj, vat_mode):
-    """obj: 'Д' или 'ДР'; vat_mode: None (освобождение), 'reduced' (5/7%), 'full' (22%)."""
+def calc_usn(p, form, obj, vat_mode, food=False):
+    """obj: 'Д' или 'ДР'; vat_mode: None (освобождение), 'reduced' (5/7%), 'full' (22%);
+    food — выручка общепита освобождена от НДС по подп. 38 п. 3 ст. 149 НК."""
+    if food:
+        p = food_payroll(p)
     income, payroll, staff = p["income"], p["payroll"], p["staff"]
     comps = dict.fromkeys(COMPONENTS, 0.0)
     steps, problems = [], []
     input_steps(steps, p)
+    ex = food_exempt(p) if food else 0.0
+    if food:
+        problems += p["food"]["problems"]
 
     if vat_mode is None:
         inc, exp, vat_rate = income, p["expenses"], 0.0
@@ -229,16 +281,20 @@ def calc_usn(p, form, obj, vat_mode):
     elif vat_mode == "reduced":
         vat_rate = 0.05 if income <= USN_VAT5_LIMIT else 0.07
         k = round(vat_rate * 100)
-        comps["НДС"] = income * vat_rate / (1 + vat_rate)
-        steps.append((f"НДС {k}% к уплате", f"{rub(income)} × {k} ÷ {100 + k} (вычетов на этой ставке нет)",
-                      comps["НДС"]))
+        taxed = food_steps(steps, p, ex)
+        comps["НДС"] = taxed * vat_rate / (1 + vat_rate)
+        steps.append((f"НДС {k}% к уплате", f"{rub(taxed)} × {k} ÷ {100 + k} (вычетов на этой ставке нет; "
+                                            "ставка — по всем доходам)", comps["НДС"]))
         inc, exp = income - comps["НДС"], p["expenses"]
         steps.append(("Выручка без НДС", f"{rub(income)} − {rub(comps['НДС'])}", inc))
         title_vat = f" + НДС {k}%"
     else:
         vat_rate = VAT
-        comps["НДС"], inc, exp = vat22_steps(steps, p)
+        comps["НДС"], inc, exp = vat22_steps(steps, p, ex)
         title_vat = " + НДС 22%"
+    if food:
+        title_vat += FOOD_TAG
+        vat_rate *= 1 - ex
 
     if income > USN_LIMIT:
         problems.append(f"доход выше лимита УСН {rub(USN_LIMIT)}")
@@ -308,12 +364,15 @@ def calc_usn(p, form, obj, vat_mode):
     return result(form, regime, comps, steps, problems, p)
 
 
-def calc_osno(p, form):
+def calc_osno(p, form, food=False):
+    if food:
+        p = food_payroll(p)
     payroll = p["payroll"]
     comps = dict.fromkeys(COMPONENTS, 0.0)
     steps = []
     input_steps(steps, p)
-    comps["НДС"], inc, exp = vat22_steps(steps, p)
+    ex = food_exempt(p) if food else 0.0
+    comps["НДС"], inc, exp = vat22_steps(steps, p, ex)
     sc = staff_steps(steps, p)
     comps["Взносы за сотрудников"] = sc
     profit = inc - exp - payroll - sc
@@ -335,7 +394,9 @@ def calc_osno(p, form):
         steps.append(("Налог на прибыль", f"{rub(max(profit, 0))} × 25%", comps["Налог"]))
         comps["НДФЛ с дивидендов"] = dividend_steps(
             steps, profit - comps["Налог"], f"{rub(profit)} − налог на прибыль {rub(comps['Налог'])}")
-    vat_loss_step(steps, p, VAT, comps)
+    vat_loss_step(steps, p, VAT * (1 - ex), comps)
+    if food:
+        return result(form, "ОСНО" + FOOD_TAG, comps, steps, list(p["food"]["problems"]), p)
     return result(form, "ОСНО", comps, steps, [], p)
 
 
@@ -560,6 +621,78 @@ def psn_verdict(years) -> tuple[str, str]:
     return "error" if bad["year"] == PSN_YEARS[0] else "warning", text
 
 
+def food_check(f):
+    """Право на освобождение общепита по итогам прошлого года.
+    Возвращает словарь: условия (название, значение, норма, выполнено), причины отказа, месяцы освобождения."""
+    total, food, pay, staff, months, region = (f["prev_total"], f["prev_food"], f["pay"], f["staff"],
+                                               f["pay_months"], f["region"])
+    share = food / total * 100 if total else 0.0
+    avg = pay / staff / months if staff and months else 0.0
+    conds = [
+        ("Доходы за прошлый год (все поступления)", rub(total), f"не больше {rub(FOOD_LIMIT)}", total <= FOOD_LIMIT),
+        ("Доля доходов от услуг общепита", f"{rub(food)} ÷ {rub(total)} × 100 = {share:.2f}%".replace(".", ","),
+         f"не меньше {FOOD_SHARE}%", share >= FOOD_SHARE),
+        ("Среднемесячные выплаты работникам",
+         (f"{rub(pay)} ÷ {staff} чел. ÷ {months} мес. = " + f"{avg:,.2f} ₽".replace(",", " ").replace(".", ","))
+         if staff and months else "нет работников по трудовым договорам",
+         f"не ниже средней по классу 56 в регионе: " + f"{region:,.2f} ₽".replace(",", " ").replace(".", ","),
+         bool(staff and months and region and avg >= region)),
+    ]
+    shortfall = max(region * months * staff - pay, 0) if staff and months else 0.0
+    out = dict(conds=conds, prev_share=share, avg=avg, problems=[], months=12, note="", shortfall=shortfall)
+    if f["new"]:
+        out["note"] = ("Организация создана (ИП зарегистрирован) в текущем году: условия о доходах, доле общепита "
+                       "и зарплате в этом году не проверяются. В следующем году они проверяются по итогам этого.")
+        return out
+    if not conds[0][3]:
+        out["problems"].append(f"доходы за прошлый год больше {rub(FOOD_LIMIT)}")
+    if not conds[1][3]:
+        out["problems"].append(f"доля общепита {share:.2f}% меньше {FOOD_SHARE}%".replace(".", ","))
+    if not conds[2][3] and f["raise"] and region:
+        name, value, norm, _ = conds[2]
+        conds[2] = (name, value + " → план: поднять до средней по региону", norm, True)
+        out["note"] = ("Сценарий «поднять зарплату»: условие о выплатах считается выполненным. Оно проверяется "
+                       "по выплатам за весь прошлый год, поэтому зарплату нужно поднять уже в нём"
+                       + (f": до конца года доплатить работникам ещё не меньше {rub(shortfall)} (премии по "
+                          "трудовым договорам входят в выплаты по РСВ)" if shortfall else "")
+                       + ". Средняя по региону за год публикуется в ЕМИСС только весной следующего года — "
+                         "закладывайте запас. В вариантах с льготой ФОТ поднят до средней по региону, "
+                         "взносы посчитаны с него.")
+    elif not conds[2][3]:
+        if not region:
+            reason = "не указана средняя зарплата по классу 56 в регионе"
+        elif not (staff and months):
+            reason = "нет выплат работникам по трудовым договорам"
+        else:
+            reason = "среднемесячные выплаты работникам ниже средней по региону"
+        soft_ok = f["soft"] and total <= FOOD_SOFT_LIMIT and conds[1][3]
+        if soft_ok:
+            out["months"] = FOOD_SOFT_MONTHS
+            out["note"] = (f"Условие о зарплате не выполнено ({reason}), но действует послабление "
+                           "Федерального закона от 25.04.2026 № 104-ФЗ: освобождение с 01.04.2026 по 31.12.2026 "
+                           f"без этого условия (доход за 2025 год не больше {rub(FOOD_SOFT_LIMIT)}, освобождение "
+                           "по ст. 145 на УСН или право на ПСН утрачено с 01.01.2026). За январь — март 2026 года "
+                           "НДС с общепита платится. С 2027 года условие о зарплате снова обязательно.")
+        else:
+            out["problems"].append(reason)
+    return out
+
+
+def food_payroll(p):
+    """Для вариантов с льготой: ФОТ, поднятый до средней зарплаты по классу 56 в регионе."""
+    f = p["food"]
+    need = f["region"] * 12 * p["staff"]
+    if not f["raise"] or need <= p["payroll"]:
+        return p
+    return dict(p, payroll=need, raised_from=p["payroll"])
+
+
+def food_exempt(p) -> float:
+    """Доля годовой выручки, освобождённой от НДС как общепит (выручка — равномерно по месяцам)."""
+    f = p["food"]
+    return f["share"] / 100 * f["months"] / 12
+
+
 def calc_all(p):
     rows = []
     for form in ("ИП", "ООО"):
@@ -568,7 +701,11 @@ def calc_all(p):
         else:
             for mode in ("reduced", "full"):
                 rows += [calc_usn(p, form, "Д", mode), calc_usn(p, form, "ДР", mode)]
+                if p["food"]:
+                    rows += [calc_usn(p, form, "Д", mode, True), calc_usn(p, form, "ДР", mode, True)]
         rows.append(calc_osno(p, form))
+        if p["food"]:
+            rows.append(calc_osno(p, form, True))
         rows += [calc_ausn(p, form, "Д"), calc_ausn(p, form, "ДР")]
         if form == "ИП" and p["psn"]:
             rows += [calc_psn(p, o) for o in psn_objects(p)]
@@ -611,6 +748,25 @@ def warnings(p, best):
                           f"Лимит выручки по УСН и патенту вместе: {rub(PSN_LIMITS[2026])} в 2026 году, "
                           f"{rub(PSN_LIMITS[2027])} в 2027 году, {rub(PSN_LIMITS[2028])} с 2028 года — "
                           "и за прошлый год, и с начала текущего."))
+    if p["food"]:
+        f = p["food"]
+        if f["problems"]:
+            w.append(("error", "Освобождение общепита от НДС недоступно: " + "; ".join(f["problems"]) + "."))
+        else:
+            w.append(("info", "Освобождение общепита по подп. 38 п. 3 ст. 149 НК обязательно, если условия выполнены. "
+                              "Варианты без пометки «льгота общепита» — это расчёт при отказе от освобождения: "
+                              "заявление в инспекцию не позднее 1-го числа квартала, с которого применяется отказ, "
+                              "срок не меньше года, отказ — по всем услугам общепита (п. 5 ст. 149 НК)."))
+        if f["note"]:
+            w.append(("warning", f["note"]))
+        w.append(("info", "Освобождение действует только на услуги общественного питания. Остальная выручка "
+                          "(поле «Доля выручки от общепита в этом году») облагается НДС как обычно. При облагаемых "
+                          "и освобождённых "
+                          "операциях нужен раздельный учёт входного НДС (п. 4 ст. 149, п. 4 ст. 170 НК); "
+                          "на УСН со ставкой 5 или 7% раздельный учёт не ведётся."))
+        if p["income"] <= USN_VAT_FREE:
+            w.append(("info", f"Выручка не больше {rub(USN_VAT_FREE)}: на УСН НДС и так не платится по ст. 145 НК, "
+                              "льгота общепита влияет только на вариант ОСНО."))
     return w
 
 
@@ -625,6 +781,7 @@ CHART_NAMES = {
     "Взносы за сотрудников": "Взносы за сотрудников",
     "НДФЛ с дивидендов": "НДФЛ с дивидендов",
     "Потери без НДС": "Скидка клиентам без НДС",
+    "Доплата зарплаты": "Доплата зарплаты для льготы",
 }
 CHART_COLORS = {
     "Налог": "#FF8A00",
@@ -634,6 +791,7 @@ CHART_COLORS = {
     "Взносы за сотрудников": "#12A33A",
     "НДФЛ с дивидендов": "#D9534F",
     "Потери без НДС": "#9E9E9E",
+    "Доплата зарплаты": "#7A4E2D",
 }
 XLSX_COLUMNS = [
     ("Название", "Вариант"),
@@ -644,6 +802,7 @@ XLSX_COLUMNS = [
     ("Взносы за сотрудников", "Взносы за сотрудников, ₽"),
     ("НДФЛ с дивидендов", "НДФЛ с дивидендов собственника ООО, ₽"),
     ("Потери без НДС", "Скидка клиентам за работу без НДС, ₽"),
+    ("Доплата зарплаты", "Доплата зарплаты до средней по региону (льгота общепита), ₽"),
     ("Итого", "Налоговая нагрузка, ₽"),
     ("% от дохода", "Налоговая нагрузка, % от выручки"),
     ("Прибыль до налогов", "Прибыль до налогов, ₽"),
@@ -654,7 +813,8 @@ XLSX_COLUMNS = [
 
 
 PART_STEPS = ("к уплате", "Взносы ИП за себя, всего", "Взносы за сотрудников", "НДФЛ с дивидендов",
-              "НДФЛ (прогрессивная", "Налог на прибыль", "Скидка клиентам")
+              "НДФЛ (прогрессивная", "Налог на прибыль", "Скидка клиентам",
+              "Доплата зарплаты")
 TOTAL_STEPS = ("Налоговая нагрузка", "Чистая прибыль после", "Чистая прибыль собственнику")
 
 
@@ -744,6 +904,20 @@ def build_xlsx(p, rows, best, years=None) -> bytes:
             ("Сотрудников на патенте", s["staff"], "0"),
             (f"Выручка за {PSN_YEARS[0] - 1} год (УСН и патент)", s["prev_income"], money),
             ("Рост выручки в следующие годы, % в год", s["growth"], "0"),
+        ]
+    if p["food"]:
+        f = p["food"]
+        data += [
+            ("Общепит: доля выручки от общепита в этом году, %", f["share"], "0"),
+            ("Общепит: создан в текущем году", "да" if f["new"] else "нет", None),
+            ("Общепит: доходы за прошлый год (все поступления)", f["prev_total"], money),
+            ("Общепит: из них от услуг общепита", f["prev_food"], money),
+            ("Общепит: выплаты работникам за прошлый год по РСВ", f["pay"], money),
+            ("Общепит: среднесписочная численность", f["staff"], "0"),
+            ("Общепит: месяцев с начислениями", f["pay_months"], "0"),
+            ("Общепит: средняя зарплата по классу 56 в регионе", f["region"], money),
+            ("Общепит: освобождение по ст. 145 или ПСН утрачены с 01.01.2026", "да" if f["soft"] else "нет", None),
+            ("Общепит: сценарий «поднять зарплату до средней по региону»", "да" if f["raise"] else "нет", None),
         ]
     for name, value, fmt in data:
         ws.append([name + (", ₽" if fmt == money else ""), round(value, 2) if isinstance(value, float) else value])
@@ -871,6 +1045,47 @@ def build_xlsx(p, rows, best, years=None) -> bytes:
         ws.append(["Прогноз: выручка, расходы и ФОТ растут на заданный процент в год; потенциальный доход "
                    "по патенту и ставки взносов — как в 2026 году."])
 
+    # Лист 5. Общепит
+    if p["food"]:
+        f = p["food"]
+        ws = wb.create_sheet("Общепит")
+        ws.append(["Освобождение общепита от НДС (подп. 38 п. 3 ст. 149 НК): условия по итогам прошлого года"])
+        ws["A1"].font = Font(bold=True, size=12)
+        ws.append([])
+        ws.append(["Условие", "Расчёт", "Норма", "Выполнено"])
+        for c in range(1, 5):
+            ws.cell(ws.max_row, c).font, ws.cell(ws.max_row, c).fill = bold, head_fill
+        for name, value, norm, ok in f["conds"]:
+            ws.append([name, value, norm, "да" if ok else "нет"])
+            for c in range(1, 5):
+                ws.cell(ws.max_row, c).border = border
+                ws.cell(ws.max_row, c).alignment = wrap
+        ws.append([])
+        if f["problems"]:
+            verdict = "Освобождения нет: " + "; ".join(f["problems"]) + "."
+        elif f["months"] < 12:
+            verdict = f"Освобождение есть на {f['months']} месяцев (апрель — декабрь 2026 года)."
+        else:
+            verdict = "Освобождение есть на весь год."
+        ws.append([verdict])
+        ws.cell(ws.max_row, 1).font = bold
+        if f["note"]:
+            ws.append([f["note"]])
+        food_rows = [r for r in rows if FOOD_TAG in r["Режим"] and r["Доступен"]]
+        plain = [r for r in rows if FOOD_TAG not in r["Режим"] and r["Доступен"] and "ПСН" not in r["Режим"]
+                 and "АУСН" not in r["Режим"]]
+        if food_rows and plain:
+            bf, bp = min(food_rows, key=lambda r: r["Итого"]), min(plain, key=lambda r: r["Итого"])
+            ws.append([])
+            for label, r in (("Лучший вариант с льготой", bf), ("Лучший вариант без льготы (отказ)", bp)):
+                ws.append([label, r["Название"], round(r["Итого"], 2)])
+                ws.cell(ws.max_row, 3).number_format = money
+            ws.append(["Выгода от льготы с учётом доплаты зарплаты", "", round(bp["Итого"] - bf["Итого"], 2)])
+            ws.cell(ws.max_row, 3).number_format = money
+            ws.cell(ws.max_row, 1).font = ws.cell(ws.max_row, 3).font = bold
+        for c, w in enumerate((44, 60, 40, 12), start=1):
+            ws.column_dimensions[get_column_letter(c)].width = w
+
     # Скрытый лист: из него калькулятор восстанавливает расчёт («Открыть сохранённый расчёт»)
     ws = wb.create_sheet(PARAMS_SHEET)
     for k, v in p["saved"].items():
@@ -919,6 +1134,9 @@ DEFAULTS = {
     "lg_d": None, "lg_dr": None, "lg_ooo": True, "msp": False,
     "psn_on": False, "psn_pvd": "1 000 000", "psn_share": 100, "psn_staff": 0, "prev_income": "12 000 000",
     "growth": 0,
+    "food_on": False, "food_share": 90, "food_new": False, "food_prev_total": "12 000 000",
+    "food_prev_food": "11 000 000", "food_pay": "1 200 000", "food_staff": 2, "food_months": 12,
+    "food_region": "0", "food_soft": False, "food_raise": False,
 }
 RATE_KINDS = ["Обычная: 6% и 15%", "Льготная ставка региона"]
 
@@ -1069,6 +1287,54 @@ with st.sidebar:
                                  help="Для прогноза: на сколько процентов в год вырастет выручка. 0 — останется как сейчас.")
         psn = dict(pvd=pvd, share=share, staff=int(psn_staff), prev_income=prev_income, growth=growth)
 
+    st.subheader("Общепит")
+    food = None
+    if st.checkbox("Посчитать льготу общепита (ОКВЭД 56)", key="food_on",
+                   help="Освобождение услуг общественного питания от НДС по подп. 38 п. 3 ст. 149 НК. "
+                        "Проверка трёх условий по итогам прошлого года и варианты «льгота общепита» в сравнении."):
+        food_share = st.slider("Доля выручки от общепита в этом году, %", 0, 100, key="food_share",
+                               help="Какая часть выручки за год — услуги общественного питания. "
+                                    "Остальное облагается НДС как обычно.")
+        food_new = st.checkbox("Организация создана / ИП зарегистрирован в этом году", key="food_new",
+                               help="В год создания условия о доходах, доле и зарплате не проверяются.")
+        if not food_new:
+            st.caption(f"Данные за {PSN_YEARS[0] - 1} год:")
+            f_total = money_input("Доходы за прошлый год — все поступления, ₽", "food_prev_total",
+                                  help=f"Все доходы, не только от общепита. Предел — {rub(FOOD_LIMIT)}.")
+            f_food = money_input("из них доходы от услуг общепита, ₽", "food_prev_food",
+                                 help=f"Должно быть не меньше {FOOD_SHARE}% от всех доходов.")
+            f_pay = money_input("Выплаты работникам по трудовым договорам за год, ₽", "food_pay",
+                                help="По РСВ: сумма строк 140 минус строки 160 подразделов 3.2.1 за все месяцы. "
+                                     "ГПД, самозанятые и дивиденды не входят.")
+            f_staff = st.number_input("Среднесписочная численность, чел.", min_value=0, step=1, key="food_staff",
+                                      help="Без внешних совместителей и работников в декрете; неполное время — "
+                                           "пропорционально отработанным часам.")
+            f_months = st.number_input("Месяцев с начислениями", min_value=1, max_value=12, step=1,
+                                       key="food_months")
+            f_region = money_input("Средняя зарплата по классу 56 ОКВЭД в регионе за прошлый год, ₽",
+                                   "food_region",
+                                   help="Среднемесячная номинальная начисленная зарплата по классу 56 «Деятельность "
+                                        "по предоставлению продуктов питания и напитков» в целом за год — "
+                                        "ЕМИСС, fedstat.ru (письмо ФНС от 01.02.2024 № СД-4-3/1079@).")
+            st.caption("Средняя зарплата по региону — на [fedstat.ru](https://fedstat.ru): поиск «среднемесячная "
+                       "номинальная начисленная заработная плата», ОКВЭД2 класс 56, ваш регион, год.")
+            f_raise = st.checkbox("Поднять зарплату до средней по региону", key="food_raise",
+                                  help="Сценарий для выполнения условия о зарплате. В вариантах «льгота "
+                                       "общепита» ФОТ = средняя по региону × 12 × число сотрудников (поле "
+                                       "«Количество сотрудников» вверху), взносы — с этого ФОТ. Варианты без "
+                                       "льготы считаются с текущим ФОТ.")
+            f_soft = st.checkbox("С 01.01.2026 утрачено освобождение по ст. 145 на УСН или право на ПСН",
+                                 key="food_soft",
+                                 help="Послабление 104-ФЗ: с 01.04.2026 по 31.12.2026 условие о зарплате не "
+                                      f"проверяется при доходе за 2025 год до {rub(FOOD_SOFT_LIMIT)}.")
+        else:
+            f_total = f_food = f_pay = f_region = 0
+            f_staff, f_months, f_soft, f_raise = 0, 12, False, False
+        food = dict(share=food_share, new=food_new, prev_total=f_total, prev_food=f_food, pay=f_pay,
+                    staff=int(f_staff), pay_months=int(f_months), region=f_region, soft=f_soft,
+                    **{"raise": f_raise})
+        food.update({k: v for k, v in food_check(food).items() if k != "share"})
+
     st.caption("💾 Введённые цифры сохраняются в адресе страницы: если обновить браузер, они не пропадут. "
                "Чтобы вернуться к расчёту позже, добавьте страницу в закладки или скачайте расчёт в Excel.")
 
@@ -1080,7 +1346,7 @@ st.query_params.from_dict({k: encode(v) for k, v in ss["_saved"].items() if v !=
 
 input_vat = min(input_vat, expenses * VAT / (1 + VAT))
 p = dict(income=income, expenses=expenses, payroll=payroll, staff=int(staff), clients_vat=clients_vat,
-         vat_discount=vat_discount, usn_rates=usn_rates, msp=msp, input_vat=input_vat, psn=psn,
+         vat_discount=vat_discount, usn_rates=usn_rates, msp=msp, input_vat=input_vat, psn=psn, food=food,
          saved=dict(ss["_saved"]))
 
 if income <= 0:
@@ -1108,8 +1374,17 @@ if years:
     level, text = psn_verdict(years)
     getattr(st, level)("**Патент.** " + text)
 
-tab_cmp, tab_psn, tab_detail, tab_warn, tab_about = st.tabs(
-    ["📊 Сравнение", "🗓 Патент по годам", "🔍 Подробный расчёт", "⚠️ Предупреждения", "ℹ️ Допущения"])
+if food:
+    if food["problems"]:
+        st.error("**Общепит.** Освобождения от НДС нет: " + "; ".join(food["problems"]) + ".")
+    elif food["months"] < 12:
+        st.warning(f"**Общепит.** Освобождение от НДС есть с апреля по декабрь 2026 года — по послаблению 104-ФЗ.")
+    else:
+        st.success("**Общепит.** Освобождение от НДС по подп. 38 п. 3 ст. 149 НК есть: все условия выполнены.")
+
+tab_cmp, tab_psn, tab_food, tab_detail, tab_warn, tab_about = st.tabs(
+    ["📊 Сравнение", "🗓 Патент по годам", "🍽 Общепит", "🔍 Подробный расчёт", "⚠️ Предупреждения",
+     "ℹ️ Допущения"])
 
 with tab_cmp:
     df = pd.DataFrame(rows).sort_values(["Доступен", "Итого"], ascending=[False, True])
@@ -1162,6 +1437,7 @@ with tab_cmp:
         "Взносы за сотрудников": "Взносы за сотрудников",
         "НДФЛ с дивидендов": "НДФЛ с дивидендов собственника ООО",
         "Потери без НДС": "Скидка клиентам за работу без НДС",
+        "Доплата зарплаты": "Доплата зарплаты до средней по региону",
         "Итого": "Налоговая нагрузка, ₽",
         "% от дохода": "Налоговая нагрузка, % от выручки",
         "Чистая прибыль": "Чистая прибыль после налогов, ₽",
@@ -1267,6 +1543,68 @@ with tab_psn:
                    "году — на 2027–2028 годы они ещё не утверждены. Подробный расчёт 2026 года — в сравнении "
                    "и на вкладке «Подробный расчёт», варианты «ИП · ПСН + УСН».")
 
+with tab_food:
+    if not food:
+        st.info("Включите «Посчитать льготу общепита» в панели слева: появится проверка права на освобождение "
+                "от НДС и варианты «льгота общепита» в сравнении.")
+    else:
+        st.markdown("**Освобождение услуг общепита от НДС** (подп. 38 п. 3 ст. 149 НК). Все три условия должны "
+                    "выполняться по итогам прошлого года: доходы не больше "
+                    f"{rub(FOOD_LIMIT)}, доля общепита не меньше {FOOD_SHARE}%, среднемесячные выплаты работникам "
+                    "не ниже средней зарплаты по классу 56 ОКВЭД в регионе.")
+        if food["new"]:
+            st.info(food["note"])
+        else:
+            lines = [{"Условие": n, "Расчёт": v, "Норма": norm, "Выполнено": "✅ да" if ok else "⛔ нет"}
+                     for n, v, norm, ok in food["conds"]]
+            html = pd.DataFrame(lines).style.hide(axis="index").set_table_attributes('class="cmp-table"').to_html()
+            st.markdown('<div class="cmp-wrap">' + "".join(l.strip() for l in html.splitlines()) + "</div>",
+                        unsafe_allow_html=True)
+            if food["note"]:
+                st.warning(food["note"])
+        if food["problems"]:
+            st.error("Освобождения нет: " + "; ".join(food["problems"]) + ". Услуги общепита облагаются НДС "
+                     "как обычно — варианты «льгота общепита» в сравнении показаны недоступными.")
+
+        food_rows = [r for r in rows if FOOD_TAG in r["Режим"]]
+        plain = [r for r in rows if FOOD_TAG not in r["Режим"] and r["Доступен"]
+                 and not r["Режим"].startswith(("ПСН", "АУСН"))]
+        if food_rows and not food["problems"] and plain:
+            bf = min([r for r in food_rows if r["Доступен"]] or food_rows, key=lambda r: r["Итого"])
+            bp = min(plain, key=lambda r: r["Итого"])
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Лучший вариант с льготой", rub(bf["Итого"]), bf["Название"], delta_color="off")
+            c2.metric("Лучший вариант без льготы (отказ)", rub(bp["Итого"]), bp["Название"], delta_color="off")
+            c3.metric("Выгода от льготы", rub(bp["Итого"] - bf["Итого"]),
+                      help="Разница нагрузки за год: налоги и взносы плюс доплата зарплаты до средней по региону. "
+                           "Если отрицательная — льгота не окупает повышение зарплаты или большой входной НДС, "
+                           "выгоднее работать с НДС.")
+            if bp["Итого"] < bf["Итого"]:
+                st.error(f"Льгота невыгодна: лучший вариант без неё ({bp['Название']}) дешевле на "
+                         f"{rub(bf['Итого'] - bp['Итого'])} в год с учётом доплаты зарплаты.")
+            else:
+                st.success(f"Льгота выгодна: {bf['Название']} дешевле лучшего варианта без льготы на "
+                           f"{rub(bp['Итого'] - bf['Итого'])} в год с учётом доплаты зарплаты.")
+            pairs = []
+            for r in food_rows:
+                twin = next((x for x in rows if x["Название"] == r["Название"].replace(FOOD_TAG, "")), None)
+                if twin:
+                    pairs.append({"Вариант": twin["Название"], "НДС без льготы": rub(twin["НДС"]),
+                                  "НДС с льготой": rub(r["НДС"]), "Нагрузка без льготы": rub(twin["Итого"]),
+                                  "Нагрузка с льготой": rub(r["Итого"]),
+                                  "Разница": rub(twin["Итого"] - r["Итого"])})
+            if pairs:
+                st.markdown("**По каждому варианту: с льготой и без неё**")
+                html = pd.DataFrame(pairs).style.hide(axis="index").set_table_attributes('class="cmp-table"').to_html()
+                st.markdown('<div class="cmp-wrap">' + "".join(l.strip() for l in html.splitlines()) + "</div>",
+                            unsafe_allow_html=True)
+        if income <= USN_VAT_FREE:
+            st.caption(f"Выручка не больше {rub(USN_VAT_FREE)}: на УСН НДС и так не платится, льгота общепита "
+                       "влияет только на ОСНО.")
+        st.caption("Как считается: освобождается выручка общепита (доля из поля слева), остальная облагается НДС. "
+                   "Входной НДС принимается к вычету только в доле облагаемой выручки, остальной остаётся в расходах. "
+                   "Ставка 5% или 7% на УСН определяется по всем доходам.")
+
 with tab_detail:
     names = [r["Название"] for r in rows]
     default = names.index(best["Название"]) if best else 0
@@ -1305,6 +1643,13 @@ with tab_about:
   Взносы ИП за себя делятся между патентом и УСН пропорционально выручке, расходы — тоже.
   Патент уменьшается на взносы полностью, если на нём нет сотрудников, иначе — не больше чем на 50%.
   Налог по патенту НДС не облагается, освобождение от НДС на УСН — по выручке обоих режимов.
+- Общепит (подп. 38 п. 3 ст. 149 НК): условия по итогам прошлого года — доходы не больше {rub(FOOD_LIMIT)},
+  доля общепита не меньше {FOOD_SHARE}%, среднемесячные выплаты работникам (выплаты по трудовым договорам ÷
+  среднесписочная численность ÷ месяцы) не ниже средней по классу 56 ОКВЭД в регионе. В год создания условия
+  не проверяются. Послабление 104-ФЗ: с апреля по декабрь 2026 года без условия о зарплате, если освобождение
+  по ст. 145 на УСН или ПСН утрачены с 01.01.2026 и доход за 2025 год не больше {rub(FOOD_SOFT_LIMIT)}.
+  Освобождается доля выручки от общепита; входной НДС к вычету — в доле облагаемой выручки, остальной — в расходах.
+  Выручка считается равномерной по месяцам.
 
 **Почему цифры могут не совпасть с ручным расчётом в Excel**
 - ИП на ОСНО: НДФЛ считается по прогрессивной шкале 13 / 15 / 18 / 20 / 22%, а не ровно 18% со всей прибыли.

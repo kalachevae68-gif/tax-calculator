@@ -33,6 +33,22 @@ INS_BASE = 2_979_000         # предельная база по страхов
 MROT = 27_093
 INJURY = 0.002               # взносы «на травматизм», минимальный класс риска
 
+# Параметры, которые различаются по годам. Выбранный год подставляется в константы выше
+# (set_year), остальные ставки и лимиты на 2027 год ещё не утверждены — берутся как в 2026.
+YEAR_PARAMS = {
+    2026: dict(IP_FIXED=57_390, IP_1PCT_CAP=321_818, USN_VAT_FREE=20_000_000),
+    # ст. 430 НК (в ред. 259-ФЗ): 61 154 ₽ и предел 1% 342 923 ₽; порог ст. 145 для УСН — 15 млн ₽ (425-ФЗ)
+    2027: dict(IP_FIXED=61_154, IP_1PCT_CAP=342_923, USN_VAT_FREE=15_000_000),
+}
+CALC_YEAR = 2026
+
+
+def set_year(year: int):
+    global CALC_YEAR
+    CALC_YEAR = year
+    globals().update(YEAR_PARAMS[year])
+
+
 # ПСН: лимит доходов по году (подп. 1 п. 6 ст. 346.45 НК в ред. 425-ФЗ), с 2028 года — 10 млн ₽.
 # При совмещении с УСН складывается выручка по обоим режимам.
 PSN_LIMITS = {2026: 20_000_000, 2027: 15_000_000, 2028: 10_000_000}
@@ -120,7 +136,7 @@ def progressive_how(amount: float, scale) -> str:
 def own_contrib_steps(steps, base_1pct: float, base_how: str) -> float:
     """Взносы ИП за себя с расшифровкой. Возвращает сумму."""
     extra = min(max(base_1pct - IP_1PCT_THRESHOLD, 0) * 0.01, IP_1PCT_CAP)
-    steps.append(("Взносы ИП за себя: фиксированные", "сумма на 2026 год, одинакова для всех ИП", IP_FIXED))
+    steps.append(("Взносы ИП за себя: фиксированные", f"сумма на {CALC_YEAR} год по ст. 430 НК, одинакова для всех ИП", IP_FIXED))
     steps.append(("Взносы ИП за себя: 1%",
                   f"({base_how} − {rub(IP_1PCT_THRESHOLD)}) × 1%, но не больше {rub(IP_1PCT_CAP)}", extra))
     steps.append(("Взносы ИП за себя, всего", f"{rub(IP_FIXED)} + {rub(extra)}", IP_FIXED + extra))
@@ -672,7 +688,7 @@ def food_check(f):
             reason = "нет выплат работникам по трудовым договорам"
         else:
             reason = "среднемесячные выплаты работникам ниже средней по региону"
-        soft_ok = f["soft"] and total <= FOOD_SOFT_LIMIT and conds[1][3]
+        soft_ok = CALC_YEAR == 2026 and f["soft"] and total <= FOOD_SOFT_LIMIT and conds[1][3]
         if soft_ok:
             out["months"] = FOOD_SOFT_MONTHS
             out["note"] = (f"Условие о зарплате не выполнено ({reason}), но действует послабление "
@@ -717,7 +733,7 @@ def calc_all(p):
             rows.append(calc_osno(p, form, True))
         rows += [calc_ausn(p, form, "Д"), calc_ausn(p, form, "ДР")]
         if form == "ИП" and p["psn"]:
-            rows += [calc_psn(p, o) for o in psn_objects(p)]
+            rows += [calc_psn(p, o, CALC_YEAR) for o in psn_objects(p)]
     return rows
 
 
@@ -887,7 +903,7 @@ def build_xlsx(p, rows, best, years=None) -> bytes:
     # Лист 1. Исходные данные
     ws = wb.active
     ws.title = "Исходные данные"
-    ws.append(["Расчёт налоговой нагрузки, правила 2026 года"])
+    ws.append([f"Расчёт налоговой нагрузки на {CALC_YEAR} год"])
     ws["A1"].font = Font(bold=True, size=14)
     ws.append([])
     rate_d, mark_d, rate_dr, mark_dr = p["usn_rates"]["ИП"]
@@ -1142,7 +1158,7 @@ DEFAULTS = {
     "clients_vat": False, "vat_discount": 15, "rate_kind": "Обычная: 6% и 15%",
     "lg_d": None, "lg_dr": None, "lg_ooo": True, "msp": False,
     "psn_on": False, "psn_pvd": "1 000 000", "psn_share": 100, "psn_staff": 0, "prev_income": "12 000 000",
-    "growth": 0,
+    "growth": 0, "year": 2026,
     "food_on": False, "food_share": 90, "food_new": False, "food_prev_total": "12 000 000",
     "food_prev_food": "11 000 000", "food_pay": "1 200 000", "food_staff": 2.0, "food_months": 12,
     "food_region": "0", "food_soft": False, "food_raise": False,
@@ -1204,7 +1220,7 @@ def money_input(label: str, key: str, help: str | None = None) -> int:
 
 
 st.title("🧮 Какую систему налогообложения выбрать")
-st.caption("ИП и ООО: УСН, ОСНО, АУСН, патент. Правила 2026 года. Расчёт ориентировочный — "
+st.caption("ИП и ООО: УСН, ОСНО, АУСН, патент. Расчёт на 2026 или 2027 год. Расчёт ориентировочный — "
            "итоговое решение принимает бухгалтер с учётом всех обстоятельств.")
 
 with st.sidebar:
@@ -1223,6 +1239,11 @@ with st.sidebar:
                          "Подходит только файл, скачанный кнопкой «Скачать расчёт в Excel».")
             ss["_loaded_file"] = uploaded.file_id
 
+    year = st.radio("Год расчёта", list(YEAR_PARAMS), key="year", horizontal=True,
+                    help="2027: взносы ИП за себя 61 154 ₽ + 1% (не больше 342 923 ₽), освобождение УСН от НДС — "
+                         "до 15 млн ₽, лимит патента 15 млн ₽. Тарифы взносов за сотрудников, МРОТ, предельная база "
+                         "и лимиты УСН на 2027 год взяты как в 2026-м — их ещё не утвердили.")
+    set_year(year)
     income = money_input("Выручка за год (с НДС), ₽", "income",
                          help="Всё, что платят клиенты за год, включая НДС, если он есть.")
     expenses = money_input("Расходы за год, ₽", "expenses",
@@ -1287,10 +1308,11 @@ with st.sidebar:
         psn_staff = st.number_input("Из них сотрудников на патенте", min_value=0, step=1, key="psn_staff",
                                     help=f"Не больше {PSN_STAFF}. Если есть — патент уменьшается на взносы "
                                          "не больше чем на 50%.")
-        prev_income = money_input(f"Выручка за {PSN_YEARS[0] - 1} год — только для права на патент "
-                                  f"в {PSN_YEARS[0]} году, ₽", "prev_income",
-                                  help="УСН и патент вместе. Нужна только для проверки 2026 года.")
-        st.caption(f"Право на патент в {PSN_YEARS[1]} году проверяется по выручке {PSN_YEARS[0]} года — это поле "
+        prev_income = money_input(f"Выручка за {year - 1} год — для права на патент "
+                                  f"в {year} году, ₽", "prev_income",
+                                  help=f"УСН и патент вместе. Лимит на {year} год — {rub(psn_limit(year))}.")
+        if year == 2026:
+          st.caption(f"Право на патент в {PSN_YEARS[1]} году проверяется по выручке {PSN_YEARS[0]} года — это поле "
                    f"«Выручка за год» вверху ({rub(income)}). На {PSN_YEARS[2]} год — по прогнозу выручки "
                    f"{PSN_YEARS[1]} года с учётом роста ниже.")
         growth = st.number_input("Рост выручки в 2027 и 2028 годах, % в год", min_value=-90, max_value=500,
@@ -1349,10 +1371,12 @@ with st.sidebar:
                                        "общепита» ФОТ = средняя по региону × 12 × число сотрудников (поле "
                                        "«Количество сотрудников» вверху), взносы — с этого ФОТ. Варианты без "
                                        "льготы считаются с текущим ФОТ.")
-            f_soft = st.checkbox("С 01.01.2026 утрачено освобождение по ст. 145 на УСН или право на ПСН",
-                                 key="food_soft",
-                                 help="Послабление 104-ФЗ: с 01.04.2026 по 31.12.2026 условие о зарплате не "
-                                      f"проверяется при доходе за 2025 год до {rub(FOOD_SOFT_LIMIT)}.")
+            f_soft = False
+            if year == 2026:
+                f_soft = st.checkbox("С 01.01.2026 утрачено освобождение по ст. 145 на УСН или право на ПСН",
+                                     key="food_soft",
+                                     help="Послабление 104-ФЗ: с 01.04.2026 по 31.12.2026 условие о зарплате не "
+                                          f"проверяется при доходе за 2025 год до {rub(FOOD_SOFT_LIMIT)}.")
         else:
             f_total = f_food = f_pay = f_region = 0
             f_staff, f_months, f_soft, f_raise = 0, 12, False, False
@@ -1651,7 +1675,7 @@ with tab_warn:
 
 with tab_about:
     st.markdown(f"""
-**Что заложено в расчёт (2026 год)**
+**Что заложено в расчёт ({CALC_YEAR} год)**
 - Взносы ИП за себя: {rub(IP_FIXED)} + 1% с дохода свыше {rub(IP_1PCT_THRESHOLD)}, но не больше {rub(IP_1PCT_CAP)}.
   На УСН «Доходы» 1% считается с дохода, на УСН «Д−Р» и ОСНО — с дохода за вычетом расходов.
 - УСН «Доходы»: ИП без сотрудников уменьшает налог на свои взносы полностью, с сотрудниками и ООО — не более чем на 50%.

@@ -633,10 +633,10 @@ def food_check(f):
         ("Доля доходов от услуг общепита", f"{rub(food)} ÷ {rub(total)} × 100 = {share:.2f}%".replace(".", ","),
          f"не меньше {FOOD_SHARE}%", share >= FOOD_SHARE),
         ("Среднемесячные выплаты работникам",
-         (f"{rub(pay)} ÷ {staff} чел. ÷ {months} мес. = " + f"{avg:,.2f} ₽".replace(",", " ").replace(".", ","))
+         (f"{rub(pay)} ÷ {staff:g} чел. ÷ {months} мес. = ".replace(".", ",", 1) + f"{avg:,.2f} ₽".replace(",", " ").replace(".", ","))
          if staff and months else "нет работников по трудовым договорам",
          f"не ниже средней по классу 56 в регионе: " + f"{region:,.2f} ₽".replace(",", " ").replace(".", ","),
-         bool(staff and months and region and avg >= region)),
+         bool(staff and months and region and round(avg, 2) >= region)),
     ]
     shortfall = max(region * months * staff - pay, 0) if staff and months else 0.0
     out = dict(conds=conds, prev_share=share, avg=avg, problems=[], months=12, note="", shortfall=shortfall)
@@ -701,7 +701,9 @@ def calc_all(p):
         else:
             for mode in ("reduced", "full"):
                 rows += [calc_usn(p, form, "Д", mode), calc_usn(p, form, "ДР", mode)]
-                if p["food"]:
+                # при 100% общепита на весь год НДС не начисляется — вариант «22%» повторял бы «5%»
+                all_free = p["food"] and p["food"]["share"] >= 100 and p["food"]["months"] == 12
+                if p["food"] and not (all_free and mode == "full"):
                     rows += [calc_usn(p, form, "Д", mode, True), calc_usn(p, form, "ДР", mode, True)]
         rows.append(calc_osno(p, form))
         if p["food"]:
@@ -1135,7 +1137,7 @@ DEFAULTS = {
     "psn_on": False, "psn_pvd": "1 000 000", "psn_share": 100, "psn_staff": 0, "prev_income": "12 000 000",
     "growth": 0,
     "food_on": False, "food_share": 90, "food_new": False, "food_prev_total": "12 000 000",
-    "food_prev_food": "11 000 000", "food_pay": "1 200 000", "food_staff": 2, "food_months": 12,
+    "food_prev_food": "11 000 000", "food_pay": "1 200 000", "food_staff": 2.0, "food_months": 12,
     "food_region": "0", "food_soft": False, "food_raise": False,
 }
 RATE_KINDS = ["Обычная: 6% и 15%", "Льготная ставка региона"]
@@ -1156,6 +1158,8 @@ def decode(key: str, raw):
     try:
         if key in ("lg_d", "lg_dr"):
             return None if raw == "" else float(raw.replace(",", "."))
+        if key == "food_staff":
+            return round(float(raw.replace(",", ".")), 2)
         if isinstance(default, bool):
             return raw in ("1", "True", "true", "да")
         if isinstance(default, int):
@@ -1298,7 +1302,8 @@ with st.sidebar:
         food_new = st.checkbox("Организация создана / ИП зарегистрирован в этом году", key="food_new",
                                help="В год создания условия о доходах, доле и зарплате не проверяются.")
         if not food_new:
-            st.caption(f"Данные за {PSN_YEARS[0] - 1} год:")
+            st.caption("Данные за прошлый год. Считаете следующий год — вводите данные текущего, "
+                       "включая плановые выплаты до конца года.")
             f_total = money_input("Доходы за прошлый год — все поступления, ₽", "food_prev_total",
                                   help=f"Все доходы, не только от общепита. Предел — {rub(FOOD_LIMIT)}.")
             f_food = money_input("из них доходы от услуг общепита, ₽", "food_prev_food",
@@ -1306,16 +1311,30 @@ with st.sidebar:
             f_pay = money_input("Выплаты работникам по трудовым договорам за год, ₽", "food_pay",
                                 help="По РСВ: сумма строк 140 минус строки 160 подразделов 3.2.1 за все месяцы. "
                                      "ГПД, самозанятые и дивиденды не входят.")
-            f_staff = st.number_input("Среднесписочная численность, чел.", min_value=0, step=1, key="food_staff",
-                                      help="Без внешних совместителей и работников в декрете; неполное время — "
-                                           "пропорционально отработанным часам.")
-            f_months = st.number_input("Месяцев с начислениями", min_value=1, max_value=12, step=1,
-                                       key="food_months")
+            f_staff = st.number_input("Среднесписочная численность за год, чел.", min_value=0.0, step=0.01,
+                                      format="%.2f", key="food_staff",
+                                      help="С двумя знаками, как в П-4 (письмо Минфина от 05.05.2025 "
+                                           "№ 03-07-07/44576). Считается так: численность каждого месяца "
+                                           "(дни в штате ÷ дни в месяце) сложить и разделить на 12. Пример: работник "
+                                           "в штате с 04.05 по 09.10 и второй с 16.11: 0,90 + 4 + 0,29 + 0,50 + 1 = "
+                                           "6,69; 6,69 ÷ 12 = 0,56. Без внешних совместителей и декретниц; "
+                                           "неполное время — пропорционально часам.")
+            f_months = st.number_input("Месяцев в году, за которые делим", min_value=1, max_value=12, step=1,
+                                       key="food_months",
+                                       help="12, если ИП или организация работали весь год — даже если работники "
+                                            "были не все месяцы: это уже учтено в среднесписочной численности. "
+                                            "Меньше 12 — только если деятельность началась в середине года.")
             f_region = money_input("Средняя зарплата по классу 56 ОКВЭД в регионе за прошлый год, ₽",
                                    "food_region",
                                    help="Среднемесячная номинальная начисленная зарплата по классу 56 «Деятельность "
                                         "по предоставлению продуктов питания и напитков» в целом за год — "
                                         "ЕМИСС, fedstat.ru (письмо ФНС от 01.02.2024 № СД-4-3/1079@).")
+            if f_staff and f_months:
+                f_avg = f_pay / f_staff / f_months
+                f_need = round(f_region * f_staff * f_months, 2)
+                st.caption(f"Среднемесячные выплаты: {rub(f_pay)} ÷ {f_staff:.2f} ÷ {f_months} = **{rub(f_avg)}**".replace(".", ",", 1)
+                           + (f". Чтобы дотянуть до {rub(f_region)}, нужно выплат за год {rub(f_need)} — "
+                              f"доплатить ещё **{rub(f_need - f_pay)}**." if f_region and f_need > f_pay else " — условие выполнено."))
             st.caption("Средняя зарплата по региону — на [fedstat.ru](https://fedstat.ru): поиск «среднемесячная "
                        "номинальная начисленная заработная плата», ОКВЭД2 класс 56, ваш регион, год.")
             f_raise = st.checkbox("Поднять зарплату до средней по региону", key="food_raise",
@@ -1331,7 +1350,7 @@ with st.sidebar:
             f_total = f_food = f_pay = f_region = 0
             f_staff, f_months, f_soft, f_raise = 0, 12, False, False
         food = dict(share=food_share, new=food_new, prev_total=f_total, prev_food=f_food, pay=f_pay,
-                    staff=int(f_staff), pay_months=int(f_months), region=f_region, soft=f_soft,
+                    staff=float(f_staff), pay_months=int(f_months), region=f_region, soft=f_soft,
                     **{"raise": f_raise})
         food.update({k: v for k, v in food_check(food).items() if k != "share"})
 
